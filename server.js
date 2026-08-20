@@ -6,6 +6,14 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
 const dotenv = require('dotenv');
+const { asyncHandler } = require('./lib/http');
+const { registerCrudRoutes } = require('./lib/crudRoutes');
+const { seedFoodData } = require('./lib/foodSeed');
+const { conversationPayload, toggleReaction } = require('./lib/conversations');
+const { fullName, formatAddress, orderTotals, cartSubtotal, newOrderNo } = require('./lib/orders');
+const { visibleToUser } = require('./lib/notifications');
+const { bulletList } = require('./lib/format');
+const { adminOnly, authOnly, createSessionUserLoader } = require('./lib/auth');
 
 dotenv.config();
 
@@ -301,27 +309,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const passwordRule = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,}$/;
 
-const CATEGORIES_SEED = [
-  ['بيتزا 🍕', 'pizzas', 'بيتزا'],
-  ['برجر 🍔', 'burgers', 'برجر'],
-  ['حلويات 🍰', 'desserts', 'حلويات'],
-  ['مشروبات 🥤', 'drinks', 'مشروبات'],
-  ['مأكولات بحرية 🦐', 'seafoods', 'مأكولات بحرية'],
-  ['مشويات 🥩', 'steaks', 'مشويات'],
-  ['دجاج مقلي 🍗', 'fried-chicken', 'دجاج مقلي'],
-  ['ساندوتشات 🥪', 'sandwiches', 'ساندوتشات'],
-  ['أيس كريم 🍦', 'ice-cream', 'أيس كريم'],
-  ['شوكولاتة 🍫', 'chocolates', 'شوكولاتة'],
-  ['مشاوي (BBQ) 🍖', 'bbqs', 'مشاوي'],
-  ['خبز (Breads) 🥖', 'breads', 'خبز'],
-  ['لحم خنزير (Porks) 🥓', 'porks', 'لحم خنزير'],
-  ['سجق (Sausages) 🌭', 'sausages', 'سجق'],
-  ['Best Food ⭐', 'best-foods', 'أفضل الأطعمة']
-];
-const CATEGORY_FALLBACK_IMAGES = {
-  desserts: 'https://goldbelly.imgix.net/uploads/showcase_media_asset/image/132029/german-chocolate-killer-brownie-tin-pack.5ebc34160f28767a9d94c4da2e04c4b9.jpg?ixlib=react-9.0.2&auto=format&ar=1%3A1'
-};
-
 async function writeLog(action, opts = {}) {
   try {
     await AdminLog.create({ action, email: opts.email || '', actionType: opts.actionType || '', userAgent: opts.userAgent || '', ip: opts.ip || '' });
@@ -351,17 +338,7 @@ async function ensureAdminUser() {
   return admin;
 }
 
-function adminOnly(req, res, next) {
-  if (!req.session.userId || req.session.role !== 'admin') {
-    return res.status(401).json({ message: 'Admin login required.' });
-  }
-  return next();
-}
-
-function authOnly(req, res, next) {
-  if (!req.session.userId) return res.status(401).json({ message: 'Login required' });
-  next();
-}
+const sessionUser = createSessionUserLoader(User);
 
 // =====================================================================
 // AUTH ROUTES
@@ -461,332 +438,249 @@ app.post('/api/logout', async (req, res) => {
 // =====================================================================
 // ADMIN ROUTES
 // =====================================================================
-app.get('/api/admin/me', adminOnly, async (req, res) => {
-  try {
-    const user = await User.findById(req.session.userId);
-    res.json({ name: `${user.firstName} ${user.lastName}`, email: user.email });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
+app.get('/api/admin/me', adminOnly, sessionUser, asyncHandler(async (req, res) => {
+  res.json({ name: fullName(req.sessionUser), email: req.sessionUser.email });
+}));
+
+app.post('/api/admin/seed-food-data', adminOnly, asyncHandler(async (_req, res) => {
+  await seedFoodData({ Category, Product });
+  await writeLog('Food data seeded/imported from APIs');
+  res.json({ message: 'Seeding done' });
+}));
+
+registerCrudRoutes(app, {
+  basePath: '/api/admin/categories',
+  model: Category,
+  guard: adminOnly,
+  resource: 'Category',
+  label: doc => doc?.nameEn,
+  writeLog
+});
+
+registerCrudRoutes(app, {
+  basePath: '/api/admin/products',
+  model: Product,
+  guard: adminOnly,
+  resource: 'Product',
+  populate: 'category',
+  writeLog
+});
+
+app.get('/api/admin/users', adminOnly, asyncHandler(async (_req, res) => {
+  const users    = await User.find().sort({ createdAt: -1 });
+  const enriched = await Promise.all(
+    users.map(async u => {
+      const orders     = await Order.find({ user: u._id });
+      const totalSpent = orders.reduce((s, o) => s + (o.total || 0), 0);
+      return { _id: u._id, name: fullName(u), email: u.email, role: u.role, joined: u.createdAt, orders: orders.length, totalSpent };
+    })
+  );
+  res.json(enriched);
+}));
+app.put('/api/admin/users/:id', adminOnly, asyncHandler(async (req, res) => {
+  const doc = await User.findByIdAndUpdate(req.params.id, { role: req.body.role }, { new: true });
+  await writeLog(`User role updated: ${doc?.email}`);
+  res.json(doc);
+}));
+app.post('/api/admin/users/:id/send-email', adminOnly, asyncHandler(async (req, res) => {
+  const user = await User.findById(req.params.id);
+  if (!user?.email) return res.status(404).json({ message: 'User email not found' });
+  const { subject, message } = req.body;
+  const smtpUser = process.env.SMTP_USER || process.env.GMAIL_USER;
+  const smtpPass = process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD;
+  if (!smtpUser || !smtpPass)
+    return res.status(400).json({ message: 'SMTP credentials missing. Add SMTP_USER + SMTP_PASS in .env' });
+  const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: smtpUser, pass: smtpPass } });
+  await transporter.sendMail({ from: smtpUser, to: user.email, subject: subject || 'Message from King Food Admin', text: message || '' });
+  await writeLog(`Email sent to ${user.email}: ${subject || 'No subject'}`);
+  res.json({ message: `Email sent successfully to ${user.email}` });
+}));
+
+app.get('/api/admin/orders', adminOnly, asyncHandler(async (_req, res) => {
+  res.json(await Order.find().sort({ createdAt: -1 }));
+}));
+app.put('/api/admin/orders/:id/status', adminOnly, asyncHandler(async (req, res) => {
+  const doc = await Order.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
+  await writeLog(`Order status updated: ${doc?.orderNo} => ${doc?.status}`);
+  res.json(doc);
+}));
+
+registerCrudRoutes(app, {
+  basePath: '/api/admin/coupons',
+  model: Coupon,
+  guard: adminOnly,
+  resource: 'Coupon',
+  label: doc => doc?.code,
+  writeLog
+});
+
+// Notifications list carries per-notification read counts, so it is not
+// generated by the CRUD factory.
+app.get('/api/admin/notifications', adminOnly, asyncHandler(async (_req, res) => {
+  const notifs = await Notification.find().populate('user').sort({ createdAt: -1 }).lean();
+  const readRecords = await NotificationRead.find({ notification: { $in: notifs.map(n => n._id) } }).lean();
+
+  const readers = {};
+  readRecords.forEach(r => {
+    if (!r.isRead) return;
+    const nid = String(r.notification);
+    (readers[nid] = readers[nid] || new Set()).add(r.userEmail);
+  });
+
+  res.json(notifs.map(n => ({ ...n, readCount: readers[String(n._id)]?.size || 0 })));
+}));
+
+registerCrudRoutes(app, {
+  basePath: '/api/admin/notifications',
+  model: Notification,
+  guard: adminOnly,
+  resource: 'Notification',
+  label: doc => doc?.title,
+  populate: 'user',
+  methods: ['create', 'update', 'delete'],
+  verbs: { create: 'sent' },
+  logMethods: ['create', 'delete'],
+  writeLog
+});
+
+app.get('/api/admin/bookings', adminOnly, asyncHandler(async (_req, res) => {
+  res.json(await TableBooking.find().sort({ createdAt: -1 }));
+}));
+app.get('/api/admin/logs', adminOnly, asyncHandler(async (_req, res) => {
+  res.json(await AdminLog.find().sort({ createdAt: -1 }).limit(200));
+}));
+app.get('/api/admin/storage-metrics', adminOnly, asyncHandler(async (_req, res) => {
+  const [users, categories, products, orders, coupons, notifications, bookings] = await Promise.all([
+    User.countDocuments(), Category.countDocuments(), Product.countDocuments(),
+    Order.countDocuments(), Coupon.countDocuments(), Notification.countDocuments(), TableBooking.countDocuments()
+  ]);
+  res.json({ users, categories, products, orders, coupons, notifications, bookings, mongoReadyState: mongoose.connection.readyState });
+}));
+
+app.get('/api/admin/analytics', adminOnly, asyncHandler(async (req, res) => {
+  const range  = req.query.range || '7d';
+  const days   = range === '365d' ? 365 : range === '30d' ? 30 : 7;
+  const start  = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const orders = await Order.find({ createdAt: { $gte: start } });
+  const totalRevenue   = orders.reduce((s, o) => s + (o.total || 0), 0);
+  const totalOrders    = orders.length;
+  const avgOrderValue  = totalOrders ? totalRevenue / totalOrders : 0;
+  const totalUsers     = await User.countDocuments();
+  const regularUsers   = await User.countDocuments({ role: 'user' });
+
+  const byStatus   = ['processing', 'shipping', 'delivered', 'cancelled'].map(s => ({ status: s, count: orders.filter(o => o.status === s).length }));
+  const topSelling = await Order.aggregate([
+    { $unwind: '$items' },
+    { $group: { _id: '$items.name', sold: { $sum: '$items.qty' }, revenue: { $sum: { $multiply: ['$items.qty', '$items.price'] } } } },
+    { $sort: { sold: -1 } },
+    { $limit: 5 }
+  ]);
+
+  const revenueSeries = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    dayStart.setDate(dayStart.getDate() - i);
+    const dayEnd = new Date(dayStart);
+    dayEnd.setHours(23, 59, 59, 999);
+    const dayRevenue = orders
+      .filter(o => o.createdAt >= dayStart && o.createdAt <= dayEnd)
+      .reduce((s, o) => s + (o.total || 0), 0);
+    revenueSeries.push({ label: dayStart.toISOString().slice(0, 10), revenue: dayRevenue });
   }
-});
+  res.json({ totalRevenue, totalOrders, avgOrderValue, totalUsers, regularUsers, byStatus, topSelling, revenueSeries });
+}));
 
-app.post('/api/admin/seed-food-data', adminOnly, async (req, res) => {
-  try {
-    for (const [en, key, ar] of CATEGORIES_SEED) {
-      const apiUrl = `https://free-food-menus-api-two.vercel.app/${key}`;
-      let category = await Category.findOne({ apiUrl });
-      if (!category) {
-        const first = await fetch(apiUrl).then(r => r.json()).then(d => d[0]).catch(() => null);
-        category = await Category.create({
-          nameEn: en, nameAr: ar, apiUrl,
-          imageUrl: first?.img || CATEGORY_FALLBACK_IMAGES[key] || '',
-          isActive: true
-        });
-      }
-      if ((await Product.countDocuments({ category: category._id })) > 0) continue;
-      const data = await fetch(apiUrl).then(r => r.json()).catch(() => []);
-      const bulk = data.map(p => ({
-        name: p.name || p.dsc || en, description: p.dsc || '',
-        price: Number(p.price) || 0, originalPrice: Number(p.price) || 0,
-        category: category._id, imageUrl: p.img || '',
-        inStock: true, featured: false, onSale: false,
-        rating: Number(p.rate) || 0, reviewsCount: 0, reviews: [], sourceApi: apiUrl
-      }));
-      if (bulk.length) await Product.insertMany(bulk);
-    }
-    await writeLog('Food data seeded/imported from APIs');
-    res.json({ message: 'Seeding done' });
-  } catch (e) {
-    res.status(500).json({ message: e.message });
-  }
-});
-
-app.get('/api/admin/categories', adminOnly, async (_req, res) => {
-  try { res.json(await Category.find().sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/admin/categories', adminOnly, async (req, res) => {
-  try { const doc = await Category.create(req.body); await writeLog(`Category created: ${doc.nameEn}`); res.status(201).json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/admin/categories/:id', adminOnly, async (req, res) => {
-  try { const doc = await Category.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Category updated: ${doc?.nameEn || req.params.id}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.delete('/api/admin/categories/:id', adminOnly, async (req, res) => {
-  try { await Category.findByIdAndDelete(req.params.id); await writeLog(`Category deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/admin/products', adminOnly, async (_req, res) => {
-  try { res.json(await Product.find().populate('category').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/admin/products', adminOnly, async (req, res) => {
-  try { const doc = await Product.create(req.body); await writeLog(`Product created: ${doc.name}`); res.status(201).json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/admin/products/:id', adminOnly, async (req, res) => {
-  try { const doc = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Product updated: ${doc?.name || req.params.id}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.delete('/api/admin/products/:id', adminOnly, async (req, res) => {
-  try { await Product.findByIdAndDelete(req.params.id); await writeLog(`Product deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/admin/users', adminOnly, async (_req, res) => {
-  try {
-    const users    = await User.find().sort({ createdAt: -1 });
-    const enriched = await Promise.all(
-      users.map(async u => {
-        const orders     = await Order.find({ user: u._id });
-        const totalSpent = orders.reduce((s, o) => s + (o.total || 0), 0);
-        return { _id: u._id, name: `${u.firstName || ''} ${u.lastName || ''}`.trim(), email: u.email, role: u.role, joined: u.createdAt, orders: orders.length, totalSpent };
-      })
-    );
-    res.json(enriched);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/admin/users/:id', adminOnly, async (req, res) => {
-  try { const doc = await User.findByIdAndUpdate(req.params.id, { role: req.body.role }, { new: true }); await writeLog(`User role updated: ${doc?.email}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/admin/users/:id/send-email', adminOnly, async (req, res) => {
-  try {
-    const user = await User.findById(req.params.id);
-    if (!user?.email) return res.status(404).json({ message: 'User email not found' });
-    const { subject, message } = req.body;
-    const smtpUser = process.env.SMTP_USER || process.env.GMAIL_USER;
-    const smtpPass = process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD;
-    if (!smtpUser || !smtpPass)
-      return res.status(400).json({ message: 'SMTP credentials missing. Add SMTP_USER + SMTP_PASS in .env' });
-    const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: smtpUser, pass: smtpPass } });
-    await transporter.sendMail({ from: smtpUser, to: user.email, subject: subject || 'Message from King Food Admin', text: message || '' });
-    await writeLog(`Email sent to ${user.email}: ${subject || 'No subject'}`);
-    res.json({ message: `Email sent successfully to ${user.email}` });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/admin/orders', adminOnly, async (_req, res) => {
-  try { res.json(await Order.find().sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/admin/orders/:id/status', adminOnly, async (req, res) => {
-  try { const doc = await Order.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true }); await writeLog(`Order status updated: ${doc?.orderNo} => ${doc?.status}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/admin/coupons', adminOnly, async (_req, res) => {
-  try { res.json(await Coupon.find().sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/admin/coupons', adminOnly, async (req, res) => {
-  try { const doc = await Coupon.create(req.body); await writeLog(`Coupon created: ${doc.code}`); res.status(201).json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/admin/coupons/:id', adminOnly, async (req, res) => {
-  try { const doc = await Coupon.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Coupon updated: ${doc?.code}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.delete('/api/admin/coupons/:id', adminOnly, async (req, res) => {
-  try { await Coupon.findByIdAndDelete(req.params.id); await writeLog(`Coupon deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/admin/notifications', adminOnly, async (_req, res) => {
-  try { res.json(await Notification.find().populate('user').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/admin/notifications', adminOnly, async (req, res) => {
-  try {
-    const doc = await Notification.create(req.body);
-    await writeLog(`Notification sent: ${doc.title}`);
-    res.status(201).json(doc);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-// Admin: get notifications with per-user read counts
-app.get('/api/admin/notifications', adminOnly, async (_req, res) => {
-  try {
-    const notifs = await Notification.find().populate('user').sort({ createdAt: -1 }).lean();
-    const notifIds = notifs.map(n => n._id);
-    const readRecords = await NotificationRead.find({ notification: { $in: notifIds } }).lean();
-
-    // Count unique users who read each notification
-    const readCountMap = {};
-    readRecords.forEach(r => {
-      const nid = String(r.notification);
-      if (!readCountMap[nid]) readCountMap[nid] = new Set();
-      if (r.isRead) readCountMap[nid].add(r.userEmail);
-    });
-
-    const enriched = notifs.map(n => ({
-      ...n,
-      readCount: readCountMap[String(n._id)] ? readCountMap[String(n._id)].size : 0
-    }));
-
-    res.json(enriched);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/admin/notifications/:id', adminOnly, async (req, res) => {
-  try { res.json(await Notification.findByIdAndUpdate(req.params.id, req.body, { new: true })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.delete('/api/admin/notifications/:id', adminOnly, async (req, res) => {
-  try { await Notification.findByIdAndDelete(req.params.id); await writeLog(`Notification deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/admin/bookings', adminOnly, async (_req, res) => {
-  try { res.json(await TableBooking.find().sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.get('/api/admin/logs', adminOnly, async (_req, res) => {
-  try { res.json(await AdminLog.find().sort({ createdAt: -1 }).limit(200)); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.get('/api/admin/storage-metrics', adminOnly, async (_req, res) => {
-  try {
-    const [users, categories, products, orders, coupons, notifications, bookings] = await Promise.all([
-      User.countDocuments(), Category.countDocuments(), Product.countDocuments(),
-      Order.countDocuments(), Coupon.countDocuments(), Notification.countDocuments(), TableBooking.countDocuments()
-    ]);
-    res.json({ users, categories, products, orders, coupons, notifications, bookings, mongoReadyState: mongoose.connection.readyState });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/admin/analytics', adminOnly, async (req, res) => {
-  try {
-    const range  = req.query.range || '7d';
-    const days   = range === '365d' ? 365 : range === '30d' ? 30 : 7;
-    const start  = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const orders = await Order.find({ createdAt: { $gte: start } });
-    const totalRevenue   = orders.reduce((s, o) => s + (o.total || 0), 0);
-    const totalOrders    = orders.length;
-    const avgOrderValue  = totalOrders ? totalRevenue / totalOrders : 0;
-    const totalUsers     = await User.countDocuments();
-    const regularUsers   = await User.countDocuments({ role: 'user' });
-
-    const byStatus   = ['processing', 'shipping', 'delivered', 'cancelled'].map(s => ({ status: s, count: orders.filter(o => o.status === s).length }));
-    const topSelling = await Order.aggregate([
-      { $unwind: '$items' },
-      { $group: { _id: '$items.name', sold: { $sum: '$items.qty' }, revenue: { $sum: { $multiply: ['$items.qty', '$items.price'] } } } },
-      { $sort: { sold: -1 } },
-      { $limit: 5 }
-    ]);
-
-    const revenueSeries = [];
-    for (let i = days - 1; i >= 0; i--) {
-      const dayStart = new Date();
-      dayStart.setHours(0, 0, 0, 0);
-      dayStart.setDate(dayStart.getDate() - i);
-      const dayEnd = new Date(dayStart);
-      dayEnd.setHours(23, 59, 59, 999);
-      const dayRevenue = orders
-        .filter(o => o.createdAt >= dayStart && o.createdAt <= dayEnd)
-        .reduce((s, o) => s + (o.total || 0), 0);
-      revenueSeries.push({ label: dayStart.toISOString().slice(0, 10), revenue: dayRevenue });
-    }
-    res.json({ totalRevenue, totalOrders, avgOrderValue, totalUsers, regularUsers, byStatus, topSelling, revenueSeries });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/admin/conversations', adminOnly, async (_req, res) => {
-  try { res.json(await Conversation.find().populate('user').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/admin/conversations/reply', adminOnly, async (req, res) => {
-  try {
-    const m = await Conversation.create({
-      user: req.body.userId, senderRole: 'admin',
-      message: req.body.message || '', imageUrl: req.body.imageUrl || '',
-      fileUrl: req.body.fileUrl || '', fileName: req.body.fileName || '',
-      fileType: req.body.fileType || '', replyTo: req.body.replyTo || null
-    });
-    await logUserAction('Admin replied to support chat', 'support', req);
-    io.to(`user:${req.body.userId}`).emit('support:new-message', m);
-    res.json(m);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/admin/conversations/reaction', adminOnly, async (req, res) => {
-  try {
-    const { messageId, emoji } = req.body;
-    const msg = await Conversation.findById(messageId);
-    if (!msg) return res.status(404).json({ message: 'Message not found' });
-    const existingIdx = msg.reactions.findIndex(r => String(r.by) === String(req.session.userId) && r.type === emoji);
-    if (existingIdx >= 0) msg.reactions.splice(existingIdx, 1);
-    else msg.reactions.push({ type: emoji, by: req.session.userId });
-    await msg.save();
-    io.to(`user:${msg.user}`).emit('support:new-message', msg);
-    io.emit('support:admin-feed', msg);
-    res.json(msg);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/admin/conversations', adminOnly, asyncHandler(async (_req, res) => {
+  res.json(await Conversation.find().populate('user').sort({ createdAt: -1 }));
+}));
+app.post('/api/admin/conversations/reply', adminOnly, asyncHandler(async (req, res) => {
+  const m = await Conversation.create(conversationPayload(req.body, 'admin', req.body.userId));
+  await logUserAction('Admin replied to support chat', 'support', req);
+  io.to(`user:${req.body.userId}`).emit('support:new-message', m);
+  res.json(m);
+}));
+app.post('/api/admin/conversations/reaction', adminOnly, asyncHandler(async (req, res) => {
+  const { messageId, emoji } = req.body;
+  const msg = await Conversation.findById(messageId);
+  if (!msg) return res.status(404).json({ message: 'Message not found' });
+  await toggleReaction(msg, req.session.userId, emoji);
+  io.to(`user:${msg.user}`).emit('support:new-message', msg);
+  io.emit('support:admin-feed', msg);
+  res.json(msg);
+}));
 
 // =====================================================================
 // STORE / PUBLIC ROUTES
 // =====================================================================
-app.get('/api/store/categories', async (_req, res) => {
-  try { res.json(await Category.find({ isActive: true }).sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.get('/api/store/products', async (_req, res) => {
-  try { res.json(await Product.find().populate('category').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.get('/api/store/products/:id', async (req, res) => {
-  try {
-    const p = await Product.findById(req.params.id).populate('category');
-    if (!p) return res.status(404).json({ message: 'Not found' });
-    res.json({ id: p._id, img: p.imageUrl, name: p.name, dsc: p.description, price: p.price, rate: p.rating, country: p.country || 'Unknown', category: p.category });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/store/categories', asyncHandler(async (_req, res) => {
+  res.json(await Category.find({ isActive: true }).sort({ createdAt: -1 }));
+}));
+app.get('/api/store/products', asyncHandler(async (_req, res) => {
+  res.json(await Product.find().populate('category').sort({ createdAt: -1 }));
+}));
+app.get('/api/store/products/:id', asyncHandler(async (req, res) => {
+  const p = await Product.findById(req.params.id).populate('category');
+  if (!p) return res.status(404).json({ message: 'Not found' });
+  res.json({ id: p._id, img: p.imageUrl, name: p.name, dsc: p.description, price: p.price, rate: p.rating, country: p.country || 'Unknown', category: p.category });
+}));
 
 // =====================================================================
 // USER ROUTES
 // =====================================================================
-app.get('/api/user/profile', authOnly, async (req, res) => {
-  try {
-    let p = await UserProfile.findOne({ user: req.session.userId });
-    if (!p) {
-      const u = await User.findById(req.session.userId);
-      p = await UserProfile.create({ user: req.session.userId, fullName: `${u.firstName || ''} ${u.lastName || ''}`.trim(), email: u.email, gender: 'male' });
-    }
-    res.json(p);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/user/profile', authOnly, async (req, res) => {
-  try {
-    const u = await UserProfile.findOne({ user: req.session.userId });
-    await logUserAction(`Profile updated: ${u?.email || req.session.email}`, 'profile', req);
-    res.json(await UserProfile.findOneAndUpdate({ user: req.session.userId }, req.body, { new: true, upsert: true }));
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/user/profile', authOnly, asyncHandler(async (req, res) => {
+  let p = await UserProfile.findOne({ user: req.session.userId });
+  if (!p) {
+    const u = await User.findById(req.session.userId);
+    p = await UserProfile.create({ user: req.session.userId, fullName: fullName(u), email: u.email, gender: 'male' });
+  }
+  res.json(p);
+}));
+app.put('/api/user/profile', authOnly, asyncHandler(async (req, res) => {
+  const u = await UserProfile.findOne({ user: req.session.userId });
+  await logUserAction(`Profile updated: ${u?.email || req.session.email}`, 'profile', req);
+  res.json(await UserProfile.findOneAndUpdate({ user: req.session.userId }, req.body, { new: true, upsert: true }));
+}));
 
-app.get('/api/user/wishlist', authOnly, async (req, res) => {
-  try { const w = await Wishlist.find({ user: req.session.userId }).populate('product'); res.json(w.map(x => x.product).filter(Boolean)); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/user/wishlist/toggle', authOnly, async (req, res) => {
-  try {
-    const { productId } = req.body;
-    const ex = await Wishlist.findOne({ user: req.session.userId, product: productId });
-    if (ex) { await ex.deleteOne(); await logUserAction(`Removed from wishlist: ${productId}`, 'wishlist', req); return res.json({ liked: false }); }
-    await Wishlist.create({ user: req.session.userId, product: productId });
-    await logUserAction(`Added to wishlist: ${productId}`, 'wishlist', req);
-    res.json({ liked: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/user/wishlist', authOnly, asyncHandler(async (req, res) => {
+  const w = await Wishlist.find({ user: req.session.userId }).populate('product');
+  res.json(w.map(x => x.product).filter(Boolean));
+}));
+app.post('/api/user/wishlist/toggle', authOnly, asyncHandler(async (req, res) => {
+  const { productId } = req.body;
+  const ex = await Wishlist.findOne({ user: req.session.userId, product: productId });
+  if (ex) { await ex.deleteOne(); await logUserAction(`Removed from wishlist: ${productId}`, 'wishlist', req); return res.json({ liked: false }); }
+  await Wishlist.create({ user: req.session.userId, product: productId });
+  await logUserAction(`Added to wishlist: ${productId}`, 'wishlist', req);
+  res.json({ liked: true });
+}));
 
-app.get('/api/user/cart', authOnly, async (req, res) => {
-  try {
-    let c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
-    if (!c) c = await Cart.create({ user: req.session.userId, items: [] });
-    res.json(c);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/user/cart', authOnly, async (req, res) => {
-  try {
-    const { productId, qty } = req.body;
-    let c = await Cart.findOne({ user: req.session.userId });
-    if (!c) c = await Cart.create({ user: req.session.userId, items: [] });
-    const idx = c.items.findIndex(i => String(i.product) === String(productId));
-    if (idx >= 0) c.items[idx].qty += qty;
-    else c.items.push({ product: productId, qty });
-    await c.save();
-    await logUserAction(`Added to cart: product=${productId} qty=${qty}`, 'cart', req);
-    res.json(c);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/user/cart/qty', authOnly, async (req, res) => {
-  try {
-    const { productId, delta } = req.body;
-    const c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
-    if (!c) return res.json({});
-    const it = c.items.find(i => String(i.product._id || i.product) === String(productId));
-    if (it) { const stock = it.product.inStock ? 999 : 0; it.qty = Math.max(1, Math.min(stock, it.qty + Number(delta || 0))); }
-    await c.save();
-    await logUserAction(`Cart qty updated: product=${productId} delta=${delta}`, 'cart', req);
-    res.json(c);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/user/cart', authOnly, asyncHandler(async (req, res) => {
+  let c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
+  if (!c) c = await Cart.create({ user: req.session.userId, items: [] });
+  res.json(c);
+}));
+app.post('/api/user/cart', authOnly, asyncHandler(async (req, res) => {
+  const { productId, qty } = req.body;
+  let c = await Cart.findOne({ user: req.session.userId });
+  if (!c) c = await Cart.create({ user: req.session.userId, items: [] });
+  const idx = c.items.findIndex(i => String(i.product) === String(productId));
+  if (idx >= 0) c.items[idx].qty += qty;
+  else c.items.push({ product: productId, qty });
+  await c.save();
+  await logUserAction(`Added to cart: product=${productId} qty=${qty}`, 'cart', req);
+  res.json(c);
+}));
+app.put('/api/user/cart/qty', authOnly, asyncHandler(async (req, res) => {
+  const { productId, delta } = req.body;
+  const c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
+  if (!c) return res.json({});
+  const it = c.items.find(i => String(i.product._id || i.product) === String(productId));
+  if (it) { const stock = it.product.inStock ? 999 : 0; it.qty = Math.max(1, Math.min(stock, it.qty + Number(delta || 0))); }
+  await c.save();
+  await logUserAction(`Cart qty updated: product=${productId} delta=${delta}`, 'cart', req);
+  res.json(c);
+}));
 app.post('/api/user/cart/apply-coupon', authOnly, async (req, res) => {
   try {
     const rawCode = (req.body.code || '').trim();
@@ -804,7 +698,7 @@ app.post('/api/user/cart/apply-coupon', authOnly, async (req, res) => {
     const cart = await Cart.findOne({ user: req.session.userId }).populate('items.product');
     if (!cart || cart.items.length === 0) return res.status(400).json({ message: 'Cart is empty' });
 
-    const subtotal = cart.items.reduce((s, i) => s + i.qty * (i.product?.price || 0), 0);
+    const subtotal = cartSubtotal(cart);
     if (coupon.minOrderAmount && subtotal < coupon.minOrderAmount)
       return res.status(400).json({ message: `Minimum order amount is $${coupon.minOrderAmount}` });
     if (coupon.maxUses && coupon.usageCount >= coupon.maxUses)
@@ -829,266 +723,204 @@ app.post('/api/user/cart/apply-coupon', authOnly, async (req, res) => {
     res.status(500).json({ message: 'Failed to apply coupon' });
   }
 });
-app.delete('/api/user/cart', authOnly, async (req, res) => {
-  try {
-    const { productId } = req.body;
-    const c = await Cart.findOne({ user: req.session.userId });
-    if (!c) return res.json({ items: [] });
-    c.items = c.items.filter(i => String(i.product) !== String(productId));
-    await c.save();
-    await logUserAction(`Removed from cart: product=${productId}`, 'cart', req);
-    res.json(c);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.delete('/api/user/cart', authOnly, asyncHandler(async (req, res) => {
+  const { productId } = req.body;
+  const c = await Cart.findOne({ user: req.session.userId });
+  if (!c) return res.json({ items: [] });
+  c.items = c.items.filter(i => String(i.product) !== String(productId));
+  await c.save();
+  await logUserAction(`Removed from cart: product=${productId}`, 'cart', req);
+  res.json(c);
+}));
 
 // ===== TOUR GUIDE PER-USER ENDPOINTS =====
-app.get('/api/user/tour-status', authOnly, async (req, res) => {
-  try {
-    const user = await User.findById(req.session.userId);
-    if (!user) return res.status(401).json({ message: 'User not found' });
-    const state = await UserTourState.findOne({ email: user.email.toLowerCase() });
-    res.json({ tourCompleted: state?.tourCompleted || false });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/user/tour-status', authOnly, sessionUser, asyncHandler(async (req, res) => {
+  const state = await UserTourState.findOne({ email: req.sessionUserEmail });
+  res.json({ tourCompleted: state?.tourCompleted || false });
+}));
 
-app.post('/api/user/tour-complete', authOnly, async (req, res) => {
-  try {
-    const user = await User.findById(req.session.userId);
-    if (!user) return res.status(401).json({ message: 'User not found' });
-    await UserTourState.findOneAndUpdate(
-      { email: user.email.toLowerCase() },
-      { tourCompleted: true, completedAt: new Date() },
-      { upsert: true }
-    );
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.post('/api/user/tour-complete', authOnly, sessionUser, asyncHandler(async (req, res) => {
+  await UserTourState.findOneAndUpdate(
+    { email: req.sessionUserEmail },
+    { tourCompleted: true, completedAt: new Date() },
+    { upsert: true }
+  );
+  res.json({ success: true });
+}));
 
 // =====================================================================
 // USER ROUTES
 // =====================================================================
 
-app.post('/api/user/orders/checkout', authOnly, async (req, res) => {
-  try {
-    const c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
-    if (!c || !c.items.length) return res.status(400).json({ message: 'Empty cart' });
-    const subtotal = c.items.reduce((s, i) => s + i.qty * (i.product?.price || 0), 0);
-    const shipping = 10;
-    const tax      = (subtotal - c.discountAmount) * 0.14;
-    const total    = subtotal + shipping + tax - c.discountAmount;
-    const u  = await User.findById(req.session.userId);
-    const ad = await UserAddress.findOne({ user: req.session.userId, isDefault: true });
-    const order = await Order.create({
-      orderNo: `ORD-${Date.now()}`, user: req.session.userId,
-      customerName: `${u.firstName || ''} ${u.lastName || ''}`.trim(),
-      customerEmail: u.email,
-      shippingAddress: ad ? `${ad.streetAddress}, ${ad.city}` : '',
-      items: c.items.map(i => ({ product: i.product._id, name: i.product.name, qty: i.qty, price: i.product.price })),
-      subtotal, shipping, tax, total,
-      discount: c.discountAmount, discountCode: c.discountCode, status: 'processing'
-    });
-    c.items         = [];
-    c.appliedCoupon = null;
-    c.discountAmount = 0;
-    c.discountCode  = null;
-    await c.save();
-    await logUserAction(`Order placed: ${order.orderNo} total=$${total.toFixed(2)}`, 'order', req);
-    res.json(order);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/user/orders/from-chat', authOnly, async (req, res) => {
-  try {
-    const { items, addressId } = req.body;
-    if (!items || !items.length) return res.status(400).json({ message: 'No items' });
-    const u        = await User.findById(req.session.userId);
-    const enriched = [];
-    let subtotal   = 0;
-    for (const item of items) {
-      const product = await Product.findById(item.id);
-      if (!product) continue;
-      const price = product.price || 0;
-      const qty   = item.qty || 1;
-      enriched.push({ product: product._id, name: product.name, qty, price });
-      subtotal += price * qty;
-    }
-    if (!enriched.length) return res.status(400).json({ message: 'No valid products' });
-    const shipping = 10;
-    const tax      = subtotal * 0.14;
-    const total    = subtotal + shipping + tax;
-    let shippingAddress = '';
-    let addrObj = null;
-    if (addressId) addrObj = await UserAddress.findOne({ _id: addressId, user: req.session.userId });
-    if (!addrObj)  addrObj = await UserAddress.findOne({ user: req.session.userId, isDefault: true });
-    if (addrObj)   shippingAddress = `${addrObj.streetAddress}, ${addrObj.city}${addrObj.country ? ', ' + addrObj.country : ''}`;
-    const order = await Order.create({
-      orderNo: `ORD-${Date.now()}`, user: req.session.userId,
-      customerName: `${u.firstName || ''} ${u.lastName || ''}`.trim(),
-      customerEmail: u.email, shippingAddress,
-      items: enriched, subtotal, shipping, tax, total,
-      discount: 0, discountCode: null, status: 'processing'
-    });
-    await logUserAction(`Order from chat: ${order.orderNo} total=$${total.toFixed(2)}`, 'order', req);
-    res.json(order);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.get('/api/user/orders', authOnly, async (req, res) => {
-  try { res.json(await Order.find({ user: req.session.userId }).populate('items.product').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.post('/api/user/orders/checkout', authOnly, sessionUser, asyncHandler(async (req, res) => {
+  const c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
+  if (!c || !c.items.length) return res.status(400).json({ message: 'Empty cart' });
+  const { subtotal, shipping, tax, total } = orderTotals(cartSubtotal(c), c.discountAmount);
+  const ad = await UserAddress.findOne({ user: req.session.userId, isDefault: true });
+  const order = await Order.create({
+    orderNo: newOrderNo(), user: req.session.userId,
+    customerName: fullName(req.sessionUser),
+    customerEmail: req.sessionUser.email,
+    shippingAddress: formatAddress(ad),
+    items: c.items.map(i => ({ product: i.product._id, name: i.product.name, qty: i.qty, price: i.product.price })),
+    subtotal, shipping, tax, total,
+    discount: c.discountAmount, discountCode: c.discountCode, status: 'processing'
+  });
+  c.items         = [];
+  c.appliedCoupon = null;
+  c.discountAmount = 0;
+  c.discountCode  = null;
+  await c.save();
+  await logUserAction(`Order placed: ${order.orderNo} total=$${total.toFixed(2)}`, 'order', req);
+  res.json(order);
+}));
+app.post('/api/user/orders/from-chat', authOnly, sessionUser, asyncHandler(async (req, res) => {
+  const { items, addressId } = req.body;
+  if (!items || !items.length) return res.status(400).json({ message: 'No items' });
+  const enriched = [];
+  let itemsSubtotal = 0;
+  for (const item of items) {
+    const product = await Product.findById(item.id);
+    if (!product) continue;
+    const price = product.price || 0;
+    const qty   = item.qty || 1;
+    enriched.push({ product: product._id, name: product.name, qty, price });
+    itemsSubtotal += price * qty;
+  }
+  if (!enriched.length) return res.status(400).json({ message: 'No valid products' });
+  const { subtotal, shipping, tax, total } = orderTotals(itemsSubtotal);
+  let addrObj = null;
+  if (addressId) addrObj = await UserAddress.findOne({ _id: addressId, user: req.session.userId });
+  if (!addrObj)  addrObj = await UserAddress.findOne({ user: req.session.userId, isDefault: true });
+  const order = await Order.create({
+    orderNo: newOrderNo(), user: req.session.userId,
+    customerName: fullName(req.sessionUser),
+    customerEmail: req.sessionUser.email, shippingAddress: formatAddress(addrObj),
+    items: enriched, subtotal, shipping, tax, total,
+    discount: 0, discountCode: null, status: 'processing'
+  });
+  await logUserAction(`Order from chat: ${order.orderNo} total=$${total.toFixed(2)}`, 'order', req);
+  res.json(order);
+}));
+app.get('/api/user/orders', authOnly, asyncHandler(async (req, res) => {
+  res.json(await Order.find({ user: req.session.userId }).populate('items.product').sort({ createdAt: -1 }));
+}));
 
-app.get('/api/user/addresses', authOnly, async (req, res) => {
-  try { res.json(await UserAddress.find({ user: req.session.userId }).sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/user/addresses', authOnly, async (req, res) => {
-  try {
-    if (req.body.isDefault) await UserAddress.updateMany({ user: req.session.userId }, { isDefault: false });
-    const a = await UserAddress.create({ ...req.body, user: req.session.userId });
-    await logUserAction(`Address added: ${a.city}`, 'address', req);
-    res.json(a);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/user/addresses/default', authOnly, async (req, res) => {
-  try {
-    await UserAddress.updateMany({ user: req.session.userId }, { isDefault: false });
-    await UserAddress.findOneAndUpdate({ _id: req.body.id, user: req.session.userId }, { isDefault: true });
-    await logUserAction(`Default address changed: ${req.body.id}`, 'address', req);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.put('/api/user/addresses/:id', authOnly, async (req, res) => {
-  try {
-    const a = await UserAddress.findOneAndUpdate({ _id: req.params.id, user: req.session.userId }, req.body, { new: true });
-    await logUserAction(`Address updated: ${a?.city}`, 'address', req);
-    res.json(a);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.delete('/api/user/addresses/:id', authOnly, async (req, res) => {
-  try {
-    await UserAddress.deleteOne({ _id: req.params.id, user: req.session.userId });
-    await logUserAction(`Address deleted: ${req.params.id}`, 'address', req);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/user/addresses', authOnly, asyncHandler(async (req, res) => {
+  res.json(await UserAddress.find({ user: req.session.userId }).sort({ createdAt: -1 }));
+}));
+app.post('/api/user/addresses', authOnly, asyncHandler(async (req, res) => {
+  if (req.body.isDefault) await UserAddress.updateMany({ user: req.session.userId }, { isDefault: false });
+  const a = await UserAddress.create({ ...req.body, user: req.session.userId });
+  await logUserAction(`Address added: ${a.city}`, 'address', req);
+  res.json(a);
+}));
+app.put('/api/user/addresses/default', authOnly, asyncHandler(async (req, res) => {
+  await UserAddress.updateMany({ user: req.session.userId }, { isDefault: false });
+  await UserAddress.findOneAndUpdate({ _id: req.body.id, user: req.session.userId }, { isDefault: true });
+  await logUserAction(`Default address changed: ${req.body.id}`, 'address', req);
+  res.json({ ok: true });
+}));
+app.put('/api/user/addresses/:id', authOnly, asyncHandler(async (req, res) => {
+  const a = await UserAddress.findOneAndUpdate({ _id: req.params.id, user: req.session.userId }, req.body, { new: true });
+  await logUserAction(`Address updated: ${a?.city}`, 'address', req);
+  res.json(a);
+}));
+app.delete('/api/user/addresses/:id', authOnly, asyncHandler(async (req, res) => {
+  await UserAddress.deleteOne({ _id: req.params.id, user: req.session.userId });
+  await logUserAction(`Address deleted: ${req.params.id}`, 'address', req);
+  res.json({ ok: true });
+}));
 
-app.get('/api/user/payments', authOnly, async (req, res) => {
-  try { res.json(await PaymentMethod.find({ user: req.session.userId })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/user/payments', authOnly, async (req, res) => {
-  try {
-    const { cardNumber, cardholderName, expiryDate, cvv, isDefault } = req.body;
-    if (!/^\d{16}$/.test(cardNumber)) return res.status(400).json({ message: 'invalid card number' });
-    if (!/^\d{3}$/.test(cvv))         return res.status(400).json({ message: 'invalid cvv' });
-    const [m, y] = expiryDate.split('/').map(Number);
-    const exp = new Date(2000 + y, m);
-    if (exp <= new Date()) return res.status(400).json({ message: 'expiry must be future' });
-    if (isDefault) await PaymentMethod.updateMany({ user: req.session.userId }, { isDefault: false });
-    const p = await PaymentMethod.create({ user: req.session.userId, cardLast4: cardNumber.slice(-4), cardholderName, expiryDate, cvv, isDefault: !!isDefault });
-    await logUserAction(`Payment method added: ****${p.cardLast4}`, 'payment', req);
-    res.json(p);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/user/payments', authOnly, asyncHandler(async (req, res) => {
+  res.json(await PaymentMethod.find({ user: req.session.userId }));
+}));
+app.post('/api/user/payments', authOnly, asyncHandler(async (req, res) => {
+  const { cardNumber, cardholderName, expiryDate, cvv, isDefault } = req.body;
+  if (!/^\d{16}$/.test(cardNumber)) return res.status(400).json({ message: 'invalid card number' });
+  if (!/^\d{3}$/.test(cvv))         return res.status(400).json({ message: 'invalid cvv' });
+  const [m, y] = expiryDate.split('/').map(Number);
+  const exp = new Date(2000 + y, m);
+  if (exp <= new Date()) return res.status(400).json({ message: 'expiry must be future' });
+  if (isDefault) await PaymentMethod.updateMany({ user: req.session.userId }, { isDefault: false });
+  const p = await PaymentMethod.create({ user: req.session.userId, cardLast4: cardNumber.slice(-4), cardholderName, expiryDate, cvv, isDefault: !!isDefault });
+  await logUserAction(`Payment method added: ****${p.cardLast4}`, 'payment', req);
+  res.json(p);
+}));
 
-app.post('/api/user/bookings', authOnly, async (req, res) => {
-  try {
-    const b = await TableBooking.create({ ...req.body, user: req.session.userId });
-    await logUserAction(`Table booked: ${b.date} ${b.time} for ${b.guests} guests`, 'booking', req);
-    res.json(b);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.post('/api/user/bookings', authOnly, asyncHandler(async (req, res) => {
+  const b = await TableBooking.create({ ...req.body, user: req.session.userId });
+  await logUserAction(`Table booked: ${b.date} ${b.time} for ${b.guests} guests`, 'booking', req);
+  res.json(b);
+}));
 
 // Per-user notification fetch with individual read status
-app.get('/api/user/notifications', authOnly, async (req, res) => {
-  try {
-    const user = await User.findById(req.session.userId);
-    if (!user) return res.status(401).json({ message: 'User not found' });
-    const userEmail = user.email.toLowerCase();
+app.get('/api/user/notifications', authOnly, sessionUser, asyncHandler(async (req, res) => {
+  const userEmail = req.sessionUserEmail;
+  const notifs = await Notification.find(visibleToUser(req.session.userId)).sort({ createdAt: -1 }).lean();
 
-    const notifs = await Notification.find({ $or: [{ user: null }, { user: req.session.userId }] }).sort({ createdAt: -1 }).lean();
+  // Resolve per-user read status
+  const notifIds = notifs.map(n => n._id);
+  const readRecords = await NotificationRead.find({ notification: { $in: notifIds }, userEmail }).lean();
+  const readMap = new Map(readRecords.map(r => [String(r.notification), r.isRead]));
 
-    // Resolve per-user read status
-    const notifIds = notifs.map(n => n._id);
-    const readRecords = await NotificationRead.find({ notification: { $in: notifIds }, userEmail }).lean();
-    const readMap = new Map(readRecords.map(r => [String(r.notification), r.isRead]));
+  const enriched = notifs.map(n => ({
+    ...n,
+    isRead: readMap.get(String(n._id)) || false
+  }));
 
-    const enriched = notifs.map(n => ({
-      ...n,
-      isRead: readMap.get(String(n._id)) || false
-    }));
-
-    res.json(enriched);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+  res.json(enriched);
+}));
 
 // Mark single notification read (per-user)
-app.post('/api/user/notifications/:id/read', authOnly, async (req, res) => {
-  try {
-    const user = await User.findById(req.session.userId);
-    if (!user) return res.status(401).json({ message: 'User not found' });
-    const userEmail = user.email.toLowerCase();
+app.post('/api/user/notifications/:id/read', authOnly, sessionUser, asyncHandler(async (req, res) => {
+  const userEmail = req.sessionUserEmail;
+  const notif = await Notification.findOne({ _id: req.params.id, ...visibleToUser(req.session.userId) });
+  if (!notif) return res.status(404).json({ message: 'Notification not found' });
 
-    const notif = await Notification.findOne({ _id: req.params.id, $or: [{ user: null }, { user: req.session.userId }] });
-    if (!notif) return res.status(404).json({ message: 'Notification not found' });
+  await NotificationRead.findOneAndUpdate(
+    { notification: notif._id, userEmail },
+    { isRead: true, readAt: new Date() },
+    { upsert: true, new: true }
+  );
 
-    await NotificationRead.findOneAndUpdate(
-      { notification: notif._id, userEmail },
-      { isRead: true, readAt: new Date() },
-      { upsert: true, new: true }
-    );
-
-    res.json({ success: true, isRead: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+  res.json({ success: true, isRead: true });
+}));
 
 // Mark all notifications read (per-user)
-app.post('/api/user/notifications/mark-all-read', authOnly, async (req, res) => {
-  try {
-    const user = await User.findById(req.session.userId);
-    if (!user) return res.status(401).json({ message: 'User not found' });
-    const userEmail = user.email.toLowerCase();
+app.post('/api/user/notifications/mark-all-read', authOnly, sessionUser, asyncHandler(async (req, res) => {
+  const userEmail = req.sessionUserEmail;
+  const notifs = await Notification.find(visibleToUser(req.session.userId)).select('_id').lean();
+  const ops = notifs.map(n => ({
+    updateOne: {
+      filter: { notification: n._id, userEmail },
+      update: { isRead: true, readAt: new Date() },
+      upsert: true
+    }
+  }));
+  if (ops.length) await NotificationRead.bulkWrite(ops);
 
-    const notifs = await Notification.find({ $or: [{ user: null }, { user: req.session.userId }] }).select('_id').lean();
-    const ops = notifs.map(n => ({
-      updateOne: {
-        filter: { notification: n._id, userEmail },
-        update: { isRead: true, readAt: new Date() },
-        upsert: true
-      }
-    }));
-    if (ops.length) await NotificationRead.bulkWrite(ops);
+  res.json({ success: true });
+}));
 
-    res.json({ success: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/user/conversations', authOnly, async (req, res) => {
-  try { res.json(await Conversation.find({ user: req.session.userId }).sort({ createdAt: 1 })); } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/user/conversations', authOnly, async (req, res) => {
-  try {
-    const m = await Conversation.create({
-      user: req.session.userId, senderRole: 'user',
-      message: req.body.message || '', imageUrl: req.body.imageUrl || '',
-      fileUrl: req.body.fileUrl || '', fileName: req.body.fileName || '',
-      fileType: req.body.fileType || '', replyTo: req.body.replyTo || null
-    });
-    await logUserAction('Support message sent', 'support', req);
-    io.emit('support:admin-feed', await Conversation.findById(m._id).populate('user').lean());
-    res.json(m);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-app.post('/api/user/conversations/reaction', authOnly, async (req, res) => {
-  try {
-    const { messageId, emoji } = req.body;
-    const msg = await Conversation.findById(messageId);
-    if (!msg) return res.status(404).json({ message: 'Message not found' });
-    const existingIdx = msg.reactions.findIndex(r => String(r.by) === String(req.session.userId) && r.type === emoji);
-    if (existingIdx >= 0) msg.reactions.splice(existingIdx, 1);
-    else msg.reactions.push({ type: emoji, by: req.session.userId });
-    await msg.save();
-    io.emit('support:admin-feed', await Conversation.findById(messageId).populate('user').lean());
-    io.to(`user:${msg.user}`).emit('support:new-message', msg);
-    res.json(msg);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/user/conversations', authOnly, asyncHandler(async (req, res) => {
+  res.json(await Conversation.find({ user: req.session.userId }).sort({ createdAt: 1 }));
+}));
+app.post('/api/user/conversations', authOnly, asyncHandler(async (req, res) => {
+  const m = await Conversation.create(conversationPayload(req.body, 'user', req.session.userId));
+  await logUserAction('Support message sent', 'support', req);
+  io.emit('support:admin-feed', await Conversation.findById(m._id).populate('user').lean());
+  res.json(m);
+}));
+app.post('/api/user/conversations/reaction', authOnly, asyncHandler(async (req, res) => {
+  const { messageId, emoji } = req.body;
+  const msg = await Conversation.findById(messageId);
+  if (!msg) return res.status(404).json({ message: 'Message not found' });
+  await toggleReaction(msg, req.session.userId, emoji);
+  io.emit('support:admin-feed', await Conversation.findById(messageId).populate('user').lean());
+  io.to(`user:${msg.user}`).emit('support:new-message', msg);
+  res.json(msg);
+}));
 
 // =====================================================================
 // FILE UPLOAD
@@ -1110,13 +942,11 @@ app.post('/api/upload', authOnly, upload.single('file'), (req, res) => {
 // =====================================================================
 // MISC
 // =====================================================================
-app.post('/api/newsletter/subscribe', async (req, res) => {
-  try {
-    await Newsletter.create({ name: req.body.name || '', email: req.body.email || '' });
-    await AdminLog.create({ action: `Newsletter subscribe: ${req.body.name || ''} ${req.body.email || ''}` });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.post('/api/newsletter/subscribe', asyncHandler(async (req, res) => {
+  await Newsletter.create({ name: req.body.name || '', email: req.body.email || '' });
+  await AdminLog.create({ action: `Newsletter subscribe: ${req.body.name || ''} ${req.body.email || ''}` });
+  res.json({ ok: true });
+}));
 
 app.post('/api/translate', async (req, res) => {
   const { text = '', target = 'ar' } = req.body;
@@ -1158,7 +988,7 @@ async function buildChatContext(userId) {
     userId ? Cart.findOne({ user: userId }).populate('items.product').lean() : null,
     userId ? Order.find({ user: userId }).sort({ createdAt: -1 }).limit(10).lean() : null,
     userId ? Wishlist.find({ user: userId }).populate('product').lean() : null,
-    userId ? Notification.find({ $or: [{ user: null }, { user: userId }] }).sort({ createdAt: -1 }).limit(10).lean() : null,
+    userId ? Notification.find(visibleToUser(userId)).sort({ createdAt: -1 }).limit(10).lean() : null,
     userId ? TableBooking.find({ user: userId }).sort({ createdAt: -1 }).limit(5).lean() : null
   ]);
 
@@ -1168,21 +998,15 @@ async function buildChatContext(userId) {
     cartInfo = `Cart${cart.discountCode ? ` (coupon: ${cart.discountCode}, discount: -$${cart.discountAmount})` : ''}:\n${lines.join('\n')}`;
   }
 
-  let ordersInfo = 'No orders placed yet.';
-  if (orders?.length)
-    ordersInfo = orders.map(o => `  • ${o.orderNo}: status=${o.status}, items=${o.items.length}, total=$${(o.total || 0).toFixed(2)}`).join('\n');
+  const ordersInfo = bulletList(orders, 'No orders placed yet.',
+    o => `  • ${o.orderNo}: status=${o.status}, items=${o.items.length}, total=$${(o.total || 0).toFixed(2)}`);
 
-  let wishlistInfo = 'Wishlist is empty.';
-  if (wishlist?.length)
-    wishlistInfo = wishlist.filter(w => w.product).map(w => `  • ${w.product.name} - $${(w.product.price || 0).toFixed(2)} - rating: ${w.product.rating || 'N/A'}`).join('\n');
+  const wishlistInfo = bulletList((wishlist || []).filter(w => w.product), 'Wishlist is empty.',
+    w => `  • ${w.product.name} - $${(w.product.price || 0).toFixed(2)} - rating: ${w.product.rating || 'N/A'}`);
 
-  let notifInfo = 'No notifications.';
-  if (notifications?.length)
-    notifInfo = notifications.map(n => `  • ${n.title}: ${n.message}`).join('\n');
+  const notifInfo = bulletList(notifications, 'No notifications.', n => `  • ${n.title}: ${n.message}`);
 
-  let bookingInfo = 'No table bookings.';
-  if (bookings?.length)
-    bookingInfo = bookings.map(b => `  • ${b.date} ${b.time} - ${b.guests} guests`).join('\n');
+  const bookingInfo = bulletList(bookings, 'No table bookings.', b => `  • ${b.date} ${b.time} - ${b.guests} guests`);
 
   const categoryMap = {};
   allCategories.forEach(c => { categoryMap[c._id] = c.nameEn || c.nameAr; });
@@ -1305,22 +1129,18 @@ app.get('/api/chat/history', async (req, res) => {
   } catch (e) { res.json([]); }
 });
 
-app.get('/api/chat/session/:id', async (req, res) => {
-  try {
-    if (!req.session?.userId) return res.status(401).json({ message: 'Login required' });
-    const s = await ChatSession.findOne({ _id: req.params.id, user: req.session.userId }).lean();
-    if (!s) return res.status(404).json({ message: 'Session not found' });
-    res.json(s);
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.get('/api/chat/session/:id', asyncHandler(async (req, res) => {
+  if (!req.session?.userId) return res.status(401).json({ message: 'Login required' });
+  const s = await ChatSession.findOne({ _id: req.params.id, user: req.session.userId }).lean();
+  if (!s) return res.status(404).json({ message: 'Session not found' });
+  res.json(s);
+}));
 
-app.delete('/api/chat/session/:id', async (req, res) => {
-  try {
-    if (!req.session?.userId) return res.status(401).json({ message: 'Login required' });
-    await ChatSession.deleteOne({ _id: req.params.id, user: req.session.userId });
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
+app.delete('/api/chat/session/:id', asyncHandler(async (req, res) => {
+  if (!req.session?.userId) return res.status(401).json({ message: 'Login required' });
+  await ChatSession.deleteOne({ _id: req.params.id, user: req.session.userId });
+  res.json({ ok: true });
+}));
 
 app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'home.html')));
 
@@ -1334,12 +1154,7 @@ io.on('connection', (socket) => {
     try {
       if (!payload.userId || !mongoose.Types.ObjectId.isValid(payload.userId))
         return socket.emit('support:error', { message: 'Invalid user session. Please login again.' });
-      const msg = await Conversation.create({
-        user: payload.userId, senderRole: 'user',
-        message: payload.message || '', imageUrl: payload.imageUrl || '',
-        fileUrl: payload.fileUrl || '', fileName: payload.fileName || '',
-        fileType: payload.fileType || '', replyTo: payload.replyTo || null
-      });
+      const msg = await Conversation.create(conversationPayload(payload, 'user', payload.userId));
       const populated = await Conversation.findById(msg._id).populate('user').lean();
       io.to(`user:${payload.userId}`).emit('support:new-message', msg);
       io.emit('support:admin-feed', populated);
@@ -1353,12 +1168,7 @@ io.on('connection', (socket) => {
     try {
       if (!payload.userId || !mongoose.Types.ObjectId.isValid(payload.userId))
         return socket.emit('support:error', { message: 'Invalid target user.' });
-      const msg = await Conversation.create({
-        user: payload.userId, senderRole: 'admin',
-        message: payload.message || '', imageUrl: payload.imageUrl || '',
-        fileUrl: payload.fileUrl || '', fileName: payload.fileName || '',
-        fileType: payload.fileType || '', replyTo: payload.replyTo || null
-      });
+      const msg = await Conversation.create(conversationPayload(payload, 'admin', payload.userId));
       io.to(`user:${payload.userId}`).emit('support:new-message', msg);
       io.emit('support:admin-feed', msg);
       io.emit('support:new-message', msg);
@@ -1371,10 +1181,7 @@ io.on('connection', (socket) => {
     try {
       const msg = await Conversation.findById(payload.messageId);
       if (!msg) return;
-      const existingIdx = msg.reactions.findIndex(r => String(r.by) === String(payload.userId) && r.type === payload.emoji);
-      if (existingIdx >= 0) msg.reactions.splice(existingIdx, 1);
-      else msg.reactions.push({ type: payload.emoji, by: payload.userId });
-      await msg.save();
+      await toggleReaction(msg, payload.userId, payload.emoji);
       io.to(`user:${payload.targetUserId || msg.user}`).emit('support:new-message', msg);
       io.emit('support:admin-feed', msg);
       io.emit('support:new-message', msg);
@@ -1396,28 +1203,7 @@ connectMongo().then(async () => {
   if (existingCategories === 0 && existingProducts === 0) {
     console.log('📦 Database empty. Auto-seeding food data from APIs...');
     try {
-      for (const [en, key, ar] of CATEGORIES_SEED) {
-        const apiUrl = `https://free-food-menus-api-two.vercel.app/${key}`;
-        let category = await Category.findOne({ apiUrl });
-        if (!category) {
-          const first = await fetch(apiUrl).then(r => r.json()).then(d => d[0]).catch(() => null);
-          category = await Category.create({
-            nameEn: en, nameAr: ar, apiUrl,
-            imageUrl: first?.img || CATEGORY_FALLBACK_IMAGES[key] || '',
-            isActive: true
-          });
-        }
-        if ((await Product.countDocuments({ category: category._id })) > 0) continue;
-        const data = await fetch(apiUrl).then(r => r.json()).catch(() => []);
-        const bulk = data.map(p => ({
-          name: p.name || p.dsc || en, description: p.dsc || '',
-          price: Number(p.price) || 0, originalPrice: Number(p.price) || 0,
-          category: category._id, imageUrl: p.img || '',
-          inStock: true, featured: false, onSale: false,
-          rating: Number(p.rate) || 0, reviewsCount: 0, reviews: [], sourceApi: apiUrl
-        }));
-        if (bulk.length) await Product.insertMany(bulk);
-      }
+      await seedFoodData({ Category, Product });
       await writeLog('Auto-seeded food data on server start');
       console.log('✅ Auto-seeding completed successfully');
     } catch (e) {
