@@ -2,11 +2,46 @@ let barChart;
 let pieChart;
 let adminSocket;
 
+// admin.html does not load site.js, so the dashboard needs its own toast —
+// without it every error report below would throw a ReferenceError and the
+// failure would stay invisible.
+function toast(message, ok = true) {
+  const zone = document.getElementById('adminToastZone') || (() => {
+    const z = document.createElement('div');
+    z.id = 'adminToastZone';
+    z.style.cssText = 'position:fixed;top:20px;right:20px;z-index:99999;max-width:420px;';
+    document.body.appendChild(z);
+    return z;
+  })();
+  const el = document.createElement('div');
+  el.className = `toast align-items-center text-bg-${ok ? 'success' : 'danger'} border-0 show mb-2`;
+  el.innerHTML = `<div class="d-flex"><div class="toast-body">${ok ? '✅' : '❌'} ${message}</div></div>`;
+  zone.appendChild(el);
+  setTimeout(() => el.remove(), 6000);
+}
+
 async function api(url, options = {}) {
   const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message || 'Request failed');
+  if (!res.ok) {
+    const err = new Error(data.message || `Request failed (HTTP ${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
   return data;
+}
+
+// Wraps async event handlers: a rejected handler promise would otherwise be
+// swallowed as an unhandled rejection with no feedback to the admin.
+function guard(context, fn) {
+  return async (...args) => {
+    try {
+      return await fn(...args);
+    } catch (e) {
+      console.error(`${context} failed:`, e);
+      toast(`${context} failed: ${e.message}`, false);
+    }
+  };
 }
 
 function switchSection(section) {
@@ -24,7 +59,18 @@ function openModal(title, body, onSubmit) {
   if (f) {
     f.addEventListener('submit', async (e) => {
       e.preventDefault();
-      await onSubmit(new FormData(f));
+      const submitBtn = f.querySelector('button:not([type=button])');
+      if (submitBtn) submitBtn.disabled = true;
+      try {
+        await onSubmit(new FormData(f));
+      } catch (err) {
+        // keep the modal open with the entered data instead of pretending the
+        // save succeeded
+        console.error(`${title} failed:`, err);
+        toast(`${title} failed: ${err.message}`, false);
+        if (submitBtn) submitBtn.disabled = false;
+        return;
+      }
       modal.hide();
       await loadAll();
     });
@@ -51,7 +97,7 @@ async function renderCategories() {
     .join('');
 }
 
-window.editCategory = function editCategory(id, nameEn, nameAr, imageUrl, isActive) {
+window.editCategory = guard('Opening category editor', function editCategory(id, nameEn, nameAr, imageUrl, isActive) {
   openModal(
     'Update Category',
     `<form id="modalForm" class="vstack gap-2"><input class="form-control" name="nameEn" value="${decodeURIComponent(nameEn)}" required><input class="form-control" name="nameAr" value="${decodeURIComponent(nameAr)}" required><input id="imageUrlPreviewInput" class="form-control" name="imageUrl" value="${decodeURIComponent(imageUrl)}"><img id="imagePreview" class="preview-img" src="${decodeURIComponent(imageUrl) || 'https://via.placeholder.com/90?text=Preview'}"><select class="form-select" name="isActive"><option value="true" ${isActive ? 'selected' : ''}>Active</option><option value="false" ${!isActive ? 'selected' : ''}>Not active</option></select><button class="btn btn-danger">Update</button></form>`,
@@ -59,7 +105,7 @@ window.editCategory = function editCategory(id, nameEn, nameAr, imageUrl, isActi
       await api(`/api/admin/categories/${id}`, { method: 'PUT', body: JSON.stringify({ nameEn: fd.get('nameEn'), nameAr: fd.get('nameAr'), imageUrl: fd.get('imageUrl'), isActive: fd.get('isActive') === 'true' }) });
     }
   );
-};
+});
 
 async function renderProducts() {
   const rows = await api('/api/admin/products');
@@ -70,7 +116,7 @@ async function renderProducts() {
     .join('');
 }
 
-window.editProduct = async function editProduct(id) {
+window.editProduct = guard('Loading product', async function editProduct(id) {
   const p = (await api('/api/admin/products')).find((x) => x._id === id);
   const categories = await api('/api/admin/categories');
   const opts = categories.map((c) => `<option value="${c._id}" ${String(p.category?._id) === String(c._id) ? 'selected' : ''}>${c.nameEn}</option>`).join('');
@@ -81,7 +127,7 @@ window.editProduct = async function editProduct(id) {
       await api(`/api/admin/products/${id}`, { method: 'PUT', body: JSON.stringify({ name: fd.get('name'), description: fd.get('description'), price: Number(fd.get('price')), originalPrice: Number(fd.get('originalPrice')), category: fd.get('category'), imageUrl: fd.get('imageUrl'), inStock: fd.get('inStock') === 'on', featured: fd.get('featured') === 'on', onSale: fd.get('onSale') === 'on' }) });
     }
   );
-};
+});
 
 async function renderOrders() {
   const rows = await api('/api/admin/orders');
@@ -89,15 +135,15 @@ async function renderOrders() {
     .map((o) => `<tr><td>${o.orderNo || o._id.slice(-8)}</td><td>${o.customerName}<br><small>${o.customerEmail || ''}</small></td><td>${new Date(o.createdAt).toLocaleDateString()}</td><td>${(o.items || []).length}</td><td>$${Number(o.total || 0).toFixed(2)}</td><td><small>${o.shippingAddress || '-'}</small></td><td>${o.status}</td><td><select onchange="updOrderStatus('${o._id}', this.value)" class="form-select form-select-sm"><option ${o.status === 'processing' ? 'selected' : ''}>processing</option><option ${o.status === 'shipping' ? 'selected' : ''}>shipping</option><option ${o.status === 'delivered' ? 'selected' : ''}>delivered</option><option ${o.status === 'cancelled' ? 'selected' : ''}>cancelled</option></select><button class="btn btn-sm btn-outline-dark mt-1" onclick="viewOrder('${o._id}')">View</button></td></tr>`)
     .join('');
 }
-window.updOrderStatus = async (id, status) => {
+window.updOrderStatus = guard('Order status update', async (id, status) => {
   await api(`/api/admin/orders/${id}/status`, { method: 'PUT', body: JSON.stringify({ status }) });
   await loadAll();
-};
-window.viewOrder = async (id) => {
+});
+window.viewOrder = guard('Loading order details', async (id) => {
   const o = (await api('/api/admin/orders')).find((x) => x._id === id);
   const items = (o.items || []).map((i) => `<li>${i.name} x${i.qty} - $${i.price}</li>`).join('');
   openModal('Order Details', `<div><b>Customer:</b> ${o.customerName} (${o.customerEmail})<br><b>Address:</b> ${o.shippingAddress || '-'}<br><b>Table Reservation:</b> ${o.tableReservation ? 'Yes' : 'No'}<ul>${items}</ul><b>Total:</b> $${o.total}</div>`, async () => {});
-};
+});
 
 async function renderUsers() {
   const rows = await api('/api/admin/users');
@@ -105,16 +151,17 @@ async function renderUsers() {
     .map((u) => `<tr><td>${u.name}<br><small>${u.email}</small></td><td>${u.role}</td><td>${new Date(u.joined).toLocaleDateString()}</td><td>${u.orders}</td><td>$${u.totalSpent.toFixed(2)}</td><td><button class="btn btn-sm btn-outline-primary" onclick="updUserRole('${u._id}','${u.role === 'admin' ? 'user' : 'admin'}')">Make ${u.role === 'admin' ? 'User' : 'Admin'}</button> <button class="btn btn-sm btn-outline-secondary" onclick="sendEmail('${u._id}')">Send Email</button></td></tr>`)
     .join('');
 }
-window.updUserRole = async (id, role) => {
+window.updUserRole = guard('Role update', async (id, role) => {
   await api(`/api/admin/users/${id}`, { method: 'PUT', body: JSON.stringify({ role }) });
   await loadAll();
-};
-window.sendEmail = async (id) => {
+});
+window.sendEmail = guard('Sending email', async (id) => {
   const subject = prompt('Email subject');
   const message = prompt('Email message');
+  if (subject === null && message === null) return;
   const result = await api(`/api/admin/users/${id}/send-email`, { method: 'POST', body: JSON.stringify({ subject, message }) });
-  alert(result.message);
-};
+  toast(result.message || 'Email sent', true);
+});
 
 async function renderCoupons() {
   const rows = await api('/api/admin/coupons');
@@ -122,25 +169,25 @@ async function renderCoupons() {
     .map((c) => `<tr><td>${c.code}</td><td>${c.discountType} ${c.discountValue}</td><td>${c.usageCount}/${c.maxUses}</td><td>${new Date(c.validFrom).toLocaleDateString()} - ${new Date(c.validUntil).toLocaleDateString()}</td><td>${c.isActive ? 'Active' : 'Inactive'}</td><td><button class="btn btn-sm btn-outline-primary" onclick="editCoupon('${c._id}')">Update</button> <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/coupons/${c._id}')">Delete</button></td></tr>`)
     .join('');
 }
-window.editCoupon = async (id) => {
+window.editCoupon = guard('Loading coupon', async (id) => {
   const c = (await api('/api/admin/coupons')).find((x) => x._id === id);
   openModal('Update Coupon', `<form id="modalForm" class="vstack gap-2"><input class="form-control" name="code" value="${c.code}"><select class="form-select" name="discountType"><option value="percentage" ${c.discountType === 'percentage' ? 'selected' : ''}>Percentage</option><option value="fixed" ${c.discountType === 'fixed' ? 'selected' : ''}>Fixed</option></select><input class="form-control" name="discountValue" type="number" value="${c.discountValue}"><input class="form-control" name="minOrderAmount" type="number" value="${c.minOrderAmount || 0}"><input class="form-control" name="maxUses" type="number" value="${c.maxUses || 0}"><input class="form-control" name="validFrom" type="date" value="${new Date(c.validFrom).toISOString().slice(0, 10)}"><input class="form-control" name="validUntil" type="date" value="${new Date(c.validUntil).toISOString().slice(0, 10)}"><select class="form-select" name="isActive"><option value="true" ${c.isActive ? 'selected' : ''}>Active</option><option value="false" ${!c.isActive ? 'selected' : ''}>Inactive</option></select><button class="btn btn-danger">Update</button></form>`, async (fd) => {
     await api(`/api/admin/coupons/${id}`, { method: 'PUT', body: JSON.stringify({ code: fd.get('code'), discountType: fd.get('discountType'), discountValue: Number(fd.get('discountValue')), minOrderAmount: Number(fd.get('minOrderAmount')), maxUses: Number(fd.get('maxUses')), validFrom: fd.get('validFrom'), validUntil: fd.get('validUntil'), isActive: fd.get('isActive') === 'true' }) });
   });
-};
+});
 
 async function renderNotifications() {
   const rows = await api('/api/admin/notifications');
   document.getElementById('notifsBody').innerHTML = rows.map((n) => `<tr><td>${n.type}</td><td>${n.user?.email || 'All Users'}</td><td>${n.title}</td><td>${n.message}</td><td>${new Date(n.createdAt).toLocaleDateString()}</td><td><button class="btn btn-sm btn-outline-primary" onclick="editNotif('${n._id}')">Update</button> <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/notifications/${n._id}')">Delete</button></td></tr>`).join('');
 }
-window.editNotif = async (id) => {
+window.editNotif = guard('Loading notification', async (id) => {
   const n = (await api('/api/admin/notifications')).find((x) => x._id === id);
   const users = await api('/api/admin/users');
   const opts = `<option value="">All Users</option>${users.map((u) => `<option value="${u._id}" ${String(n.user?._id) === String(u._id) ? 'selected' : ''}>${u.email}</option>`).join('')}`;
   openModal('Update Notification', `<form id="modalForm" class="vstack gap-2"><select class="form-select" name="type"><option value="promotion" ${n.type === 'promotion' ? 'selected' : ''}>promotion</option><option value="system" ${n.type === 'system' ? 'selected' : ''}>system</option><option value="delivery" ${n.type === 'delivery' ? 'selected' : ''}>delivery</option><option value="order_update" ${n.type === 'order_update' ? 'selected' : ''}>order update</option></select><select class="form-select" name="user">${opts}</select><input class="form-control" name="title" value="${n.title}"><textarea class="form-control" name="message">${n.message}</textarea><input class="form-control" name="actionLink" value="${n.actionLink || ''}" placeholder="Action link"><button class="btn btn-danger">Update</button></form>`, async (fd) => {
     await api(`/api/admin/notifications/${id}`, { method: 'PUT', body: JSON.stringify({ type: fd.get('type'), user: fd.get('user') || null, title: fd.get('title'), message: fd.get('message'), actionLink: fd.get('actionLink') }) });
   });
-};
+});
 
 async function renderBookings() {
   const rows = await api('/api/admin/bookings');
@@ -311,7 +358,10 @@ async function adminSendReply() {
     adminReplyToMsg = null;
     adminUpdateReplyIndicator();
     await renderConversations();
-  } catch(e) { toast('Reply failed', false); }
+  } catch (e) {
+    console.error('Reply failed:', e);
+    toast(`Reply failed: ${e.message}`, false);
+  }
 }
 
 function adminReactToMsg(messageId, emoji) {
@@ -319,13 +369,23 @@ function adminReactToMsg(messageId, emoji) {
   if (adminSocket) {
     adminSocket.emit('support:reaction', { messageId, emoji, userId: currentAdminId, targetUserId: adminSelectedUserId });
   } else {
-    api('/api/admin/conversations/reaction', { method: 'POST', body: JSON.stringify({ messageId, emoji }) }).catch(() => {});
+    api('/api/admin/conversations/reaction', { method: 'POST', body: JSON.stringify({ messageId, emoji }) })
+      .catch((e) => {
+        console.error('Reaction failed:', e);
+        toast(`Reaction failed: ${e.message}`, false);
+      });
   }
 }
 
 function adminCopyMsg(btn) {
   const text = btn.closest('.amsg')?.textContent?.trim() || '';
-  if (text) { navigator.clipboard.writeText(text); toast('Copied!', true); }
+  if (!text) return;
+  navigator.clipboard.writeText(text)
+    .then(() => toast('Copied!', true))
+    .catch((e) => {
+      console.error('Copy failed:', e);
+      toast('Could not copy the message', false);
+    });
 }
 
 function adminReplyTo(id, text) {
@@ -365,25 +425,37 @@ async function renderAnalytics() {
   document.getElementById('storageMetrics').innerHTML = `Users: <b>${m.users}</b> | Categories: <b>${m.categories}</b> | Products: <b>${m.products}</b> | Orders: <b>${m.orders}</b> | Coupons: <b>${m.coupons}</b> | Notifications: <b>${m.notifications}</b> | Bookings: <b>${m.bookings}</b> | Mongo ReadyState: <b>${m.mongoReadyState}</b>`;
 }
 
-window.del = async function del(url) {
+window.del = guard('Delete', async function del(url) {
   if (!confirm('Delete item?')) return;
   await api(url, { method: 'DELETE' });
   await loadAll();
-};
+});
 
+// Renders every section independently: one broken section must not blank out
+// the whole dashboard, and each failure is reported instead of dropped.
 async function loadAll() {
-  await Promise.all([
-    renderCategories(),
-    renderProducts(),
-    renderOrders(),
-    renderUsers(),
-    renderCoupons(),
-    renderNotifications(),
-    renderConversations(),
-    renderBookings(),
-    renderLogs(),
-    renderAnalytics()
-  ]);
+  const sections = [
+    ['Categories', renderCategories],
+    ['Products', renderProducts],
+    ['Orders', renderOrders],
+    ['Users', renderUsers],
+    ['Coupons', renderCoupons],
+    ['Notifications', renderNotifications],
+    ['Conversations', renderConversations],
+    ['Bookings', renderBookings],
+    ['Logs', renderLogs],
+    ['Analytics', renderAnalytics]
+  ];
+  const results = await Promise.allSettled(sections.map(([, fn]) => fn()));
+  const failures = results
+    .map((r, i) => (r.status === 'rejected' ? { name: sections[i][0], reason: r.reason } : null))
+    .filter(Boolean);
+  failures.forEach(({ name, reason }) => console.error(`${name} section failed to load:`, reason));
+  if (failures.length) {
+    const authFailure = failures.find(f => f.reason?.status === 401);
+    if (authFailure) throw authFailure.reason;
+    toast(`Failed to load: ${failures.map(f => f.name).join(', ')}`, false);
+  }
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -392,6 +464,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     adminSocket.on('support:admin-feed', () => renderConversations());
     adminSocket.on('support:new-message', () => {
       renderConversations();
+    });
+    adminSocket.on('support:error', (err) => {
+      console.error('Support socket error:', err);
+      toast(err?.message || 'Support chat error', false);
+    });
+    adminSocket.on('connect_error', (err) => {
+      console.error('Support socket connection error:', err);
     });
   }
   // Bind admin chat controls
@@ -410,14 +489,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       formData.append('file', file);
       try {
         const res = await fetch('/api/upload', { method: 'POST', body: formData });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.message || `Upload failed (HTTP ${res.status})`);
         if (adminSocket) {
           adminSocket.emit('support:admin-reply', { userId: adminSelectedUserId, message: '', fileUrl: data.fileUrl, fileName: data.fileName, fileType: data.fileType });
         } else {
           await api('/api/admin/conversations/reply', { method: 'POST', body: JSON.stringify({ userId: adminSelectedUserId, message: '', fileUrl: data.fileUrl, fileName: data.fileName, fileType: data.fileType }) });
         }
         await renderConversations();
-      } catch(e) { toast('Upload failed', false); }
+      } catch (e) {
+        console.error('Upload failed:', e);
+        toast(`Upload failed: ${e.message}`, false);
+      }
       fileInput.value = '';
     };
   }
@@ -443,50 +526,62 @@ document.addEventListener('DOMContentLoaded', async () => {
       closeSidebar();
     }
   });
-  document.getElementById('rangeSelect').addEventListener('change', renderAnalytics);
+  document.getElementById('rangeSelect').addEventListener('change', guard('Analytics reload', renderAnalytics));
   document.getElementById('logoutBtn').addEventListener('click', async () => {
-    await api('/api/logout', { method: 'POST' });
+    try {
+      await api('/api/logout', { method: 'POST' });
+    } catch (e) {
+      console.error('Logout request failed:', e);
+      toast(`Logout may not have completed: ${e.message}`, false);
+    }
     location.href = '/login.html';
   });
 
-  document.getElementById('seedBtn').addEventListener('click', async () => {
-    await api('/api/admin/seed-food-data', { method: 'POST' });
+  document.getElementById('seedBtn').addEventListener('click', guard('Seeding', async () => {
+    const result = await api('/api/admin/seed-food-data', { method: 'POST' });
+    toast(result.message || 'Seeding done', true);
     await loadAll();
-  });
+  }));
 
-  document.getElementById('addCategoryBtn').addEventListener('click', () => {
+  document.getElementById('addCategoryBtn').addEventListener('click', guard('Opening category form', () => {
     openModal('Add New Category', `<form id="modalForm" class="vstack gap-2"><label>Name (English)</label><input class="form-control" name="nameEn" placeholder="e.g. steaks" required><label>Name (Arabic)</label><input class="form-control" name="nameAr" placeholder="e.g. مشويات" required><label>Image URL</label><input id="imageUrlPreviewInput" class="form-control" name="imageUrl" placeholder="https://..." required><img id="imagePreview" class="preview-img" src="https://via.placeholder.com/90?text=Preview"><select class="form-select" name="isActive"><option value="true">Active</option><option value="false">Not active</option></select><button class="btn btn-danger">Create</button></form>`, async (fd) => {
       await api('/api/admin/categories', { method: 'POST', body: JSON.stringify({ nameEn: fd.get('nameEn'), nameAr: fd.get('nameAr'), imageUrl: fd.get('imageUrl'), isActive: fd.get('isActive') === 'true' }) });
     });
-  });
+  }));
 
-  document.getElementById('addProductBtn').addEventListener('click', async () => {
+  document.getElementById('addProductBtn').addEventListener('click', guard('Opening product form', async () => {
     const categories = await api('/api/admin/categories');
     const opts = categories.map((c) => `<option value="${c._id}">${c.nameEn}</option>`).join('');
     openModal('Add New Product', `<form id="modalForm" class="vstack gap-2"><input class="form-control" name="name" placeholder="Product Name" required><textarea class="form-control" name="description" placeholder="Description"></textarea><div class="row g-2"><div class="col"><input class="form-control" type="number" step="0.01" name="price" placeholder="Price ($)" required></div><div class="col"><input class="form-control" type="number" step="0.01" name="originalPrice" placeholder="Original Price ($)"></div></div><label>Category</label><select class="form-select" name="category">${opts}</select><label>Image URL</label><input id="imageUrlPreviewInput" class="form-control" name="imageUrl" placeholder="https://..." required><img id="imagePreview" class="preview-img" src="https://via.placeholder.com/90?text=Preview"><div class="row"><div class="col"><label><input type="checkbox" name="inStock" checked> In Stock</label></div><div class="col"><label><input type="checkbox" name="featured"> Featured</label></div><div class="col"><label><input type="checkbox" name="onSale"> On Sale</label></div></div><button class="btn btn-danger">Create</button></form>`, async (fd) => {
       await api('/api/admin/products', { method: 'POST', body: JSON.stringify({ name: fd.get('name'), description: fd.get('description'), price: Number(fd.get('price')), originalPrice: Number(fd.get('originalPrice')), category: fd.get('category'), imageUrl: fd.get('imageUrl'), inStock: fd.get('inStock') === 'on', featured: fd.get('featured') === 'on', onSale: fd.get('onSale') === 'on' }) });
     });
-  });
+  }));
 
-  document.getElementById('addCouponBtn').addEventListener('click', () => {
+  document.getElementById('addCouponBtn').addEventListener('click', guard('Opening promo code form', () => {
     openModal('Create Promo Code', `<form id="modalForm" class="vstack gap-2"><input class="form-control" name="code" placeholder="Promo Code" required><select class="form-select" name="discountType"><option value="percentage">Percentage (%)</option><option value="fixed">Fixed</option></select><input class="form-control" name="discountValue" type="number" value="20" required><input class="form-control" name="minOrderAmount" type="number" value="50" required><input class="form-control" name="maxUses" type="number" value="100" required><input class="form-control" name="validFrom" type="date" required><input class="form-control" name="validUntil" type="date" required><select class="form-select" name="isActive"><option value="true">Active</option><option value="false">Not active</option></select><div class="d-flex gap-2 justify-content-end"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-danger">Create</button></div></form>`, async (fd) => {
       await api('/api/admin/coupons', { method: 'POST', body: JSON.stringify({ code: fd.get('code'), discountType: fd.get('discountType'), discountValue: Number(fd.get('discountValue')), minOrderAmount: Number(fd.get('minOrderAmount')), maxUses: Number(fd.get('maxUses')), validFrom: fd.get('validFrom'), validUntil: fd.get('validUntil'), isActive: fd.get('isActive') === 'true' }) });
     });
-  });
+  }));
 
-  document.getElementById('addNotifBtn').addEventListener('click', async () => {
+  document.getElementById('addNotifBtn').addEventListener('click', guard('Opening notification form', async () => {
     const users = await api('/api/admin/users');
     const opts = `<option value="">All Users</option>${users.map((u) => `<option value="${u._id}">${u.email}</option>`).join('')}`;
     openModal('Send Notification', `<form id="modalForm" class="vstack gap-2"><label>Type</label><select class="form-select" name="type"><option value="promotion">Promotion</option><option value="system">System</option><option value="delivery">Delivery</option><option value="order_update">Order Update</option></select><label>Send to User</label><select class="form-select" name="user">${opts}</select><input class="form-control" name="title" placeholder="Flash Sale Alert! 🔥" required><textarea class="form-control" name="message" placeholder="Summer collection is now 50% off!" required></textarea><input class="form-control" name="actionLink" placeholder="Action Link (optional)"><div class="d-flex gap-2 justify-content-end"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button class="btn btn-danger">Send</button></div></form>`, async (fd) => {
       await api('/api/admin/notifications', { method: 'POST', body: JSON.stringify({ type: fd.get('type'), user: fd.get('user') || null, title: fd.get('title'), message: fd.get('message'), actionLink: fd.get('actionLink') }) });
     });
-  });
+  }));
 
   try {
     await loadAdminMeta();
     await loadAll();
   } catch (e) {
-    alert(`${e.message}. Please login as admin first.`);
-    location.href = '/login.html';
+    console.error('Admin dashboard failed to initialise:', e);
+    // only a real authentication problem should bounce to the login page
+    if (e.status === 401 || e.status === 403) {
+      alert(`${e.message}. Please login as admin first.`);
+      location.href = '/login.html';
+      return;
+    }
+    toast(`Dashboard failed to load: ${e.message}`, false);
   }
 });

@@ -35,7 +35,8 @@ process.on('unhandledRejection', (reason) => {
   if (mongoKeywords.some(k => msg.includes(k))) {
     console.error('⚠️ MongoDB unhandled rejection (non-fatal):', msg);
   } else {
-    console.error('⚠️ Unhandled Rejection:', msg);
+    // keep the stack — a bare message hides where the rejection came from
+    console.error('⚠️ Unhandled Rejection:', reason?.stack || reason);
   }
 });
 // =====================================================================
@@ -56,7 +57,7 @@ mongoose.set('strictQuery', false);
 // =====================================================================
 // ✅ CONNECT MONGO — ثابت لا يوقف الـ server أبداً
 // =====================================================================
-async function connectMongo() {
+async function connectMongo(attempt = 1) {
   try {
     await mongoose.connect(MONGO_URI, {
       serverSelectionTimeoutMS: 30000,
@@ -87,10 +88,10 @@ async function connectMongo() {
     });
 
   } catch (error) {
-    console.error('❌ MongoDB connection failed:', error.message || error);
-    console.log('🔄 Retrying in 5 seconds...');
+    console.error(`❌ MongoDB connection failed (attempt ${attempt}):`, error.message || error);
+    console.log('🔄 Retrying in 5 seconds... (server will not accept traffic until Mongo is reachable)');
     await new Promise(resolve => setTimeout(resolve, 5000));
-    return connectMongo();
+    return connectMongo(attempt + 1);
   }
 }
 // =====================================================================
@@ -322,6 +323,26 @@ const CATEGORY_FALLBACK_IMAGES = {
   desserts: 'https://goldbelly.imgix.net/uploads/showcase_media_asset/image/132029/german-chocolate-killer-brownie-tin-pack.5ebc34160f28767a9d94c4da2e04c4b9.jpg?ixlib=react-9.0.2&auto=format&ar=1%3A1'
 };
 
+// =====================================================================
+// ✅ API ERROR HELPER
+// Always logs the real error server-side (with stack) and answers with a
+// status code that reflects what actually failed, instead of leaking
+// internal messages or hiding the failure behind a 200/empty payload.
+// =====================================================================
+function apiError(res, context, e, fallbackMessage = 'Internal server error') {
+  console.error(`❌ ${context}:`, e?.stack || e);
+  if (res.headersSent) return res;
+  if (e?.name === 'ValidationError') return res.status(400).json({ message: e.message });
+  if (e?.name === 'CastError') return res.status(400).json({ message: `Invalid value for "${e.path}"` });
+  if (e?.code === 11000) {
+    const field = Object.keys(e.keyPattern || e.keyValue || {}).join(', ') || 'field';
+    return res.status(409).json({ message: `Duplicate value for ${field}` });
+  }
+  if (typeof e?.name === 'string' && e.name.startsWith('Mongo'))
+    return res.status(503).json({ message: 'Database is unavailable, please try again' });
+  return res.status(500).json({ message: fallbackMessage });
+}
+
 async function writeLog(action, opts = {}) {
   try {
     await AdminLog.create({ action, email: opts.email || '', actionType: opts.actionType || '', userAgent: opts.userAgent || '', ip: opts.ip || '' });
@@ -335,6 +356,51 @@ async function logUserAction(action, actionType, req) {
   const userAgent = req?.headers?.['user-agent'] || '';
   const ip        = req?.ip || req?.headers?.['x-forwarded-for'] || req?.connection?.remoteAddress || '';
   await writeLog(action, { email, actionType, userAgent, ip });
+}
+
+// Fetches JSON and fails loudly on HTTP errors / unexpected payloads, so a
+// broken upstream API is never mistaken for "category has no products".
+async function fetchJsonArray(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText} from ${url}`);
+  const data = await resp.json();
+  if (!Array.isArray(data)) throw new Error(`Unexpected payload (not an array) from ${url}`);
+  return data;
+}
+
+// Imports the remote food catalogue. Returns the categories that could not be
+// imported so callers can report a partial failure instead of "done".
+async function seedFoodData() {
+  const failed = [];
+  for (const [en, key, ar] of CATEGORIES_SEED) {
+    const apiUrl = `https://free-food-menus-api-two.vercel.app/${key}`;
+    try {
+      let category = await Category.findOne({ apiUrl });
+      let items = null;
+      if (!category) {
+        items = await fetchJsonArray(apiUrl);
+        category = await Category.create({
+          nameEn: en, nameAr: ar, apiUrl,
+          imageUrl: items[0]?.img || CATEGORY_FALLBACK_IMAGES[key] || '',
+          isActive: true
+        });
+      }
+      if ((await Product.countDocuments({ category: category._id })) > 0) continue;
+      if (!items) items = await fetchJsonArray(apiUrl);
+      const bulk = items.map(p => ({
+        name: p.name || p.dsc || en, description: p.dsc || '',
+        price: Number(p.price) || 0, originalPrice: Number(p.price) || 0,
+        category: category._id, imageUrl: p.img || '',
+        inStock: true, featured: false, onSale: false,
+        rating: Number(p.rate) || 0, reviewsCount: 0, reviews: [], sourceApi: apiUrl
+      }));
+      if (bulk.length) await Product.insertMany(bulk);
+    } catch (e) {
+      console.error(`⚠️ Seeding category "${key}" failed:`, e.message);
+      failed.push(key);
+    }
+  }
+  return failed;
 }
 
 async function ensureAdminUser() {
@@ -422,7 +488,7 @@ app.post('/api/forgot-password', async (req, res) => {
     await user.save();
     res.json({ message: 'Demo mode: reset code generated', resetCode: code });
   } catch (e) {
-    res.status(500).json({ message: 'Failed' });
+    apiError(res, 'POST /api/forgot-password', e, 'Failed to generate reset code');
   }
 });
 
@@ -445,14 +511,15 @@ app.post('/api/reset-password', async (req, res) => {
     await user.save();
     res.json({ message: 'Password reset successful' });
   } catch (e) {
-    res.status(500).json({ message: 'Failed' });
+    apiError(res, 'POST /api/reset-password', e, 'Failed to reset password');
   }
 });
 
 app.post('/api/logout', async (req, res) => {
   const email = req.session?.email || 'guest';
   await logUserAction(`User logged out: ${email}`, 'auth', req);
-  req.session.destroy(() => {
+  req.session.destroy((err) => {
+    if (err) return apiError(res, 'POST /api/logout', err, 'Logout failed');
     res.clearCookie('connect.sid');
     res.json({ message: 'Logged out' });
   });
@@ -464,67 +531,51 @@ app.post('/api/logout', async (req, res) => {
 app.get('/api/admin/me', adminOnly, async (req, res) => {
   try {
     const user = await User.findById(req.session.userId);
-    res.json({ name: `${user.firstName} ${user.lastName}`, email: user.email });
+    if (!user) return res.status(404).json({ message: 'Admin account not found' });
+    res.json({ _id: user._id, name: `${user.firstName} ${user.lastName}`, email: user.email });
   } catch (e) {
-    res.status(500).json({ message: e.message });
+    apiError(res, 'GET /api/admin/me', e);
   }
 });
 
 app.post('/api/admin/seed-food-data', adminOnly, async (req, res) => {
   try {
-    for (const [en, key, ar] of CATEGORIES_SEED) {
-      const apiUrl = `https://free-food-menus-api-two.vercel.app/${key}`;
-      let category = await Category.findOne({ apiUrl });
-      if (!category) {
-        const first = await fetch(apiUrl).then(r => r.json()).then(d => d[0]).catch(() => null);
-        category = await Category.create({
-          nameEn: en, nameAr: ar, apiUrl,
-          imageUrl: first?.img || CATEGORY_FALLBACK_IMAGES[key] || '',
-          isActive: true
-        });
-      }
-      if ((await Product.countDocuments({ category: category._id })) > 0) continue;
-      const data = await fetch(apiUrl).then(r => r.json()).catch(() => []);
-      const bulk = data.map(p => ({
-        name: p.name || p.dsc || en, description: p.dsc || '',
-        price: Number(p.price) || 0, originalPrice: Number(p.price) || 0,
-        category: category._id, imageUrl: p.img || '',
-        inStock: true, featured: false, onSale: false,
-        rating: Number(p.rate) || 0, reviewsCount: 0, reviews: [], sourceApi: apiUrl
-      }));
-      if (bulk.length) await Product.insertMany(bulk);
-    }
-    await writeLog('Food data seeded/imported from APIs');
+    const failed = await seedFoodData();
+    await writeLog(failed.length
+      ? `Food data seeded with ${failed.length} failed categories: ${failed.join(', ')}`
+      : 'Food data seeded/imported from APIs');
+    if (failed.length)
+      return res.status(502).json({ message: `Seeding finished with errors. Failed categories: ${failed.join(', ')}`, failedCategories: failed });
     res.json({ message: 'Seeding done' });
   } catch (e) {
-    res.status(500).json({ message: e.message });
+    apiError(res, 'POST /api/admin/seed-food-data', e);
   }
 });
 
 app.get('/api/admin/categories', adminOnly, async (_req, res) => {
-  try { res.json(await Category.find().sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Category.find().sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/admin/categories', e); }
 });
 app.post('/api/admin/categories', adminOnly, async (req, res) => {
-  try { const doc = await Category.create(req.body); await writeLog(`Category created: ${doc.nameEn}`); res.status(201).json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const doc = await Category.create(req.body); await writeLog(`Category created: ${doc.nameEn}`); res.status(201).json(doc); } catch (e) { apiError(res, 'POST /api/admin/categories', e); }
 });
 app.put('/api/admin/categories/:id', adminOnly, async (req, res) => {
-  try { const doc = await Category.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Category updated: ${doc?.nameEn || req.params.id}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const doc = await Category.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Category updated: ${doc?.nameEn || req.params.id}`); res.json(doc); } catch (e) { apiError(res, 'PUT /api/admin/categories/:id', e); }
 });
 app.delete('/api/admin/categories/:id', adminOnly, async (req, res) => {
-  try { await Category.findByIdAndDelete(req.params.id); await writeLog(`Category deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { await Category.findByIdAndDelete(req.params.id); await writeLog(`Category deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { apiError(res, 'DELETE /api/admin/categories/:id', e); }
 });
 
 app.get('/api/admin/products', adminOnly, async (_req, res) => {
-  try { res.json(await Product.find().populate('category').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Product.find().populate('category').sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/admin/products', e); }
 });
 app.post('/api/admin/products', adminOnly, async (req, res) => {
-  try { const doc = await Product.create(req.body); await writeLog(`Product created: ${doc.name}`); res.status(201).json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const doc = await Product.create(req.body); await writeLog(`Product created: ${doc.name}`); res.status(201).json(doc); } catch (e) { apiError(res, 'POST /api/admin/products', e); }
 });
 app.put('/api/admin/products/:id', adminOnly, async (req, res) => {
-  try { const doc = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Product updated: ${doc?.name || req.params.id}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const doc = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Product updated: ${doc?.name || req.params.id}`); res.json(doc); } catch (e) { apiError(res, 'PUT /api/admin/products/:id', e); }
 });
 app.delete('/api/admin/products/:id', adminOnly, async (req, res) => {
-  try { await Product.findByIdAndDelete(req.params.id); await writeLog(`Product deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { await Product.findByIdAndDelete(req.params.id); await writeLog(`Product deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { apiError(res, 'DELETE /api/admin/products/:id', e); }
 });
 
 app.get('/api/admin/users', adminOnly, async (_req, res) => {
@@ -538,10 +589,10 @@ app.get('/api/admin/users', adminOnly, async (_req, res) => {
       })
     );
     res.json(enriched);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/admin/users', e); }
 });
 app.put('/api/admin/users/:id', adminOnly, async (req, res) => {
-  try { const doc = await User.findByIdAndUpdate(req.params.id, { role: req.body.role }, { new: true }); await writeLog(`User role updated: ${doc?.email}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const doc = await User.findByIdAndUpdate(req.params.id, { role: req.body.role }, { new: true }); await writeLog(`User role updated: ${doc?.email}`); res.json(doc); } catch (e) { apiError(res, 'PUT /api/admin/users/:id', e); }
 });
 app.post('/api/admin/users/:id/send-email', adminOnly, async (req, res) => {
   try {
@@ -556,38 +607,38 @@ app.post('/api/admin/users/:id/send-email', adminOnly, async (req, res) => {
     await transporter.sendMail({ from: smtpUser, to: user.email, subject: subject || 'Message from King Food Admin', text: message || '' });
     await writeLog(`Email sent to ${user.email}: ${subject || 'No subject'}`);
     res.json({ message: `Email sent successfully to ${user.email}` });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/admin/users/:id/send-email', e, `Failed to send email: ${e.message}`); }
 });
 
 app.get('/api/admin/orders', adminOnly, async (_req, res) => {
-  try { res.json(await Order.find().sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Order.find().sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/admin/orders', e); }
 });
 app.put('/api/admin/orders/:id/status', adminOnly, async (req, res) => {
-  try { const doc = await Order.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true }); await writeLog(`Order status updated: ${doc?.orderNo} => ${doc?.status}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const doc = await Order.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true }); await writeLog(`Order status updated: ${doc?.orderNo} => ${doc?.status}`); res.json(doc); } catch (e) { apiError(res, 'PUT /api/admin/orders/:id/status', e); }
 });
 
 app.get('/api/admin/coupons', adminOnly, async (_req, res) => {
-  try { res.json(await Coupon.find().sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Coupon.find().sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/admin/coupons', e); }
 });
 app.post('/api/admin/coupons', adminOnly, async (req, res) => {
-  try { const doc = await Coupon.create(req.body); await writeLog(`Coupon created: ${doc.code}`); res.status(201).json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const doc = await Coupon.create(req.body); await writeLog(`Coupon created: ${doc.code}`); res.status(201).json(doc); } catch (e) { apiError(res, 'POST /api/admin/coupons', e); }
 });
 app.put('/api/admin/coupons/:id', adminOnly, async (req, res) => {
-  try { const doc = await Coupon.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Coupon updated: ${doc?.code}`); res.json(doc); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const doc = await Coupon.findByIdAndUpdate(req.params.id, req.body, { new: true }); await writeLog(`Coupon updated: ${doc?.code}`); res.json(doc); } catch (e) { apiError(res, 'PUT /api/admin/coupons/:id', e); }
 });
 app.delete('/api/admin/coupons/:id', adminOnly, async (req, res) => {
-  try { await Coupon.findByIdAndDelete(req.params.id); await writeLog(`Coupon deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { await Coupon.findByIdAndDelete(req.params.id); await writeLog(`Coupon deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { apiError(res, 'DELETE /api/admin/coupons/:id', e); }
 });
 
 app.get('/api/admin/notifications', adminOnly, async (_req, res) => {
-  try { res.json(await Notification.find().populate('user').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Notification.find().populate('user').sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/admin/notifications', e); }
 });
 app.post('/api/admin/notifications', adminOnly, async (req, res) => {
   try {
     const doc = await Notification.create(req.body);
     await writeLog(`Notification sent: ${doc.title}`);
     res.status(201).json(doc);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/admin/notifications', e); }
 });
 
 // Admin: get notifications with per-user read counts
@@ -611,20 +662,20 @@ app.get('/api/admin/notifications', adminOnly, async (_req, res) => {
     }));
 
     res.json(enriched);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/admin/notifications', e); }
 });
 app.put('/api/admin/notifications/:id', adminOnly, async (req, res) => {
-  try { res.json(await Notification.findByIdAndUpdate(req.params.id, req.body, { new: true })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Notification.findByIdAndUpdate(req.params.id, req.body, { new: true })); } catch (e) { apiError(res, 'PUT /api/admin/notifications/:id', e); }
 });
 app.delete('/api/admin/notifications/:id', adminOnly, async (req, res) => {
-  try { await Notification.findByIdAndDelete(req.params.id); await writeLog(`Notification deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { await Notification.findByIdAndDelete(req.params.id); await writeLog(`Notification deleted: ${req.params.id}`); res.json({ ok: true }); } catch (e) { apiError(res, 'DELETE /api/admin/notifications/:id', e); }
 });
 
 app.get('/api/admin/bookings', adminOnly, async (_req, res) => {
-  try { res.json(await TableBooking.find().sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await TableBooking.find().sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/admin/bookings', e); }
 });
 app.get('/api/admin/logs', adminOnly, async (_req, res) => {
-  try { res.json(await AdminLog.find().sort({ createdAt: -1 }).limit(200)); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await AdminLog.find().sort({ createdAt: -1 }).limit(200)); } catch (e) { apiError(res, 'GET /api/admin/logs', e); }
 });
 app.get('/api/admin/storage-metrics', adminOnly, async (_req, res) => {
   try {
@@ -633,7 +684,7 @@ app.get('/api/admin/storage-metrics', adminOnly, async (_req, res) => {
       Order.countDocuments(), Coupon.countDocuments(), Notification.countDocuments(), TableBooking.countDocuments()
     ]);
     res.json({ users, categories, products, orders, coupons, notifications, bookings, mongoReadyState: mongoose.connection.readyState });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/admin/storage-metrics', e); }
 });
 
 app.get('/api/admin/analytics', adminOnly, async (req, res) => {
@@ -669,11 +720,11 @@ app.get('/api/admin/analytics', adminOnly, async (req, res) => {
       revenueSeries.push({ label: dayStart.toISOString().slice(0, 10), revenue: dayRevenue });
     }
     res.json({ totalRevenue, totalOrders, avgOrderValue, totalUsers, regularUsers, byStatus, topSelling, revenueSeries });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/admin/analytics', e); }
 });
 
 app.get('/api/admin/conversations', adminOnly, async (_req, res) => {
-  try { res.json(await Conversation.find().populate('user').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Conversation.find().populate('user').sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/admin/conversations', e); }
 });
 app.post('/api/admin/conversations/reply', adminOnly, async (req, res) => {
   try {
@@ -686,7 +737,7 @@ app.post('/api/admin/conversations/reply', adminOnly, async (req, res) => {
     await logUserAction('Admin replied to support chat', 'support', req);
     io.to(`user:${req.body.userId}`).emit('support:new-message', m);
     res.json(m);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/admin/conversations/reply', e); }
 });
 app.post('/api/admin/conversations/reaction', adminOnly, async (req, res) => {
   try {
@@ -700,24 +751,24 @@ app.post('/api/admin/conversations/reaction', adminOnly, async (req, res) => {
     io.to(`user:${msg.user}`).emit('support:new-message', msg);
     io.emit('support:admin-feed', msg);
     res.json(msg);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/admin/conversations/reaction', e); }
 });
 
 // =====================================================================
 // STORE / PUBLIC ROUTES
 // =====================================================================
 app.get('/api/store/categories', async (_req, res) => {
-  try { res.json(await Category.find({ isActive: true }).sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Category.find({ isActive: true }).sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/store/categories', e); }
 });
 app.get('/api/store/products', async (_req, res) => {
-  try { res.json(await Product.find().populate('category').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Product.find().populate('category').sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/store/products', e); }
 });
 app.get('/api/store/products/:id', async (req, res) => {
   try {
     const p = await Product.findById(req.params.id).populate('category');
     if (!p) return res.status(404).json({ message: 'Not found' });
     res.json({ id: p._id, img: p.imageUrl, name: p.name, dsc: p.description, price: p.price, rate: p.rating, country: p.country || 'Unknown', category: p.category });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/store/products/:id', e); }
 });
 
 // =====================================================================
@@ -731,18 +782,18 @@ app.get('/api/user/profile', authOnly, async (req, res) => {
       p = await UserProfile.create({ user: req.session.userId, fullName: `${u.firstName || ''} ${u.lastName || ''}`.trim(), email: u.email, gender: 'male' });
     }
     res.json(p);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/user/profile', e); }
 });
 app.put('/api/user/profile', authOnly, async (req, res) => {
   try {
     const u = await UserProfile.findOne({ user: req.session.userId });
     await logUserAction(`Profile updated: ${u?.email || req.session.email}`, 'profile', req);
     res.json(await UserProfile.findOneAndUpdate({ user: req.session.userId }, req.body, { new: true, upsert: true }));
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'PUT /api/user/profile', e); }
 });
 
 app.get('/api/user/wishlist', authOnly, async (req, res) => {
-  try { const w = await Wishlist.find({ user: req.session.userId }).populate('product'); res.json(w.map(x => x.product).filter(Boolean)); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { const w = await Wishlist.find({ user: req.session.userId }).populate('product'); res.json(w.map(x => x.product).filter(Boolean)); } catch (e) { apiError(res, 'GET /api/user/wishlist', e); }
 });
 app.post('/api/user/wishlist/toggle', authOnly, async (req, res) => {
   try {
@@ -752,7 +803,7 @@ app.post('/api/user/wishlist/toggle', authOnly, async (req, res) => {
     await Wishlist.create({ user: req.session.userId, product: productId });
     await logUserAction(`Added to wishlist: ${productId}`, 'wishlist', req);
     res.json({ liked: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/wishlist/toggle', e); }
 });
 
 app.get('/api/user/cart', authOnly, async (req, res) => {
@@ -760,7 +811,7 @@ app.get('/api/user/cart', authOnly, async (req, res) => {
     let c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
     if (!c) c = await Cart.create({ user: req.session.userId, items: [] });
     res.json(c);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/user/cart', e); }
 });
 app.post('/api/user/cart', authOnly, async (req, res) => {
   try {
@@ -773,19 +824,21 @@ app.post('/api/user/cart', authOnly, async (req, res) => {
     await c.save();
     await logUserAction(`Added to cart: product=${productId} qty=${qty}`, 'cart', req);
     res.json(c);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/cart', e); }
 });
 app.put('/api/user/cart/qty', authOnly, async (req, res) => {
   try {
     const { productId, delta } = req.body;
     const c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
-    if (!c) return res.json({});
+    if (!c) return res.status(404).json({ message: 'Cart not found' });
     const it = c.items.find(i => String(i.product._id || i.product) === String(productId));
-    if (it) { const stock = it.product.inStock ? 999 : 0; it.qty = Math.max(1, Math.min(stock, it.qty + Number(delta || 0))); }
+    if (!it) return res.status(404).json({ message: 'Product is not in the cart' });
+    const stock = it.product.inStock ? 999 : 0;
+    it.qty = Math.max(1, Math.min(stock, it.qty + Number(delta || 0)));
     await c.save();
     await logUserAction(`Cart qty updated: product=${productId} delta=${delta}`, 'cart', req);
     res.json(c);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'PUT /api/user/cart/qty', e); }
 });
 app.post('/api/user/cart/apply-coupon', authOnly, async (req, res) => {
   try {
@@ -826,7 +879,7 @@ app.post('/api/user/cart/apply-coupon', authOnly, async (req, res) => {
     await logUserAction(`Coupon applied: ${coupon.code} discount=$${discount.toFixed(2)}`, 'coupon', req);
     res.json({ discount, finalTotal: subtotal - discount, appliedCoupon: coupon.code, message: 'Coupon applied successfully' });
   } catch (e) {
-    res.status(500).json({ message: 'Failed to apply coupon' });
+    apiError(res, 'POST /api/user/cart/apply-coupon', e, 'Failed to apply coupon');
   }
 });
 app.delete('/api/user/cart', authOnly, async (req, res) => {
@@ -838,7 +891,7 @@ app.delete('/api/user/cart', authOnly, async (req, res) => {
     await c.save();
     await logUserAction(`Removed from cart: product=${productId}`, 'cart', req);
     res.json(c);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'DELETE /api/user/cart', e); }
 });
 
 // ===== TOUR GUIDE PER-USER ENDPOINTS =====
@@ -848,7 +901,7 @@ app.get('/api/user/tour-status', authOnly, async (req, res) => {
     if (!user) return res.status(401).json({ message: 'User not found' });
     const state = await UserTourState.findOne({ email: user.email.toLowerCase() });
     res.json({ tourCompleted: state?.tourCompleted || false });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/user/tour-status', e); }
 });
 
 app.post('/api/user/tour-complete', authOnly, async (req, res) => {
@@ -861,7 +914,7 @@ app.post('/api/user/tour-complete', authOnly, async (req, res) => {
       { upsert: true }
     );
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/tour-complete', e); }
 });
 
 // =====================================================================
@@ -894,7 +947,7 @@ app.post('/api/user/orders/checkout', authOnly, async (req, res) => {
     await c.save();
     await logUserAction(`Order placed: ${order.orderNo} total=$${total.toFixed(2)}`, 'order', req);
     res.json(order);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/orders/checkout', e); }
 });
 app.post('/api/user/orders/from-chat', authOnly, async (req, res) => {
   try {
@@ -929,14 +982,14 @@ app.post('/api/user/orders/from-chat', authOnly, async (req, res) => {
     });
     await logUserAction(`Order from chat: ${order.orderNo} total=$${total.toFixed(2)}`, 'order', req);
     res.json(order);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/orders/from-chat', e); }
 });
 app.get('/api/user/orders', authOnly, async (req, res) => {
-  try { res.json(await Order.find({ user: req.session.userId }).populate('items.product').sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Order.find({ user: req.session.userId }).populate('items.product').sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/user/orders', e); }
 });
 
 app.get('/api/user/addresses', authOnly, async (req, res) => {
-  try { res.json(await UserAddress.find({ user: req.session.userId }).sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await UserAddress.find({ user: req.session.userId }).sort({ createdAt: -1 })); } catch (e) { apiError(res, 'GET /api/user/addresses', e); }
 });
 app.post('/api/user/addresses', authOnly, async (req, res) => {
   try {
@@ -944,7 +997,7 @@ app.post('/api/user/addresses', authOnly, async (req, res) => {
     const a = await UserAddress.create({ ...req.body, user: req.session.userId });
     await logUserAction(`Address added: ${a.city}`, 'address', req);
     res.json(a);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/addresses', e); }
 });
 app.put('/api/user/addresses/default', authOnly, async (req, res) => {
   try {
@@ -952,25 +1005,25 @@ app.put('/api/user/addresses/default', authOnly, async (req, res) => {
     await UserAddress.findOneAndUpdate({ _id: req.body.id, user: req.session.userId }, { isDefault: true });
     await logUserAction(`Default address changed: ${req.body.id}`, 'address', req);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'PUT /api/user/addresses/default', e); }
 });
 app.put('/api/user/addresses/:id', authOnly, async (req, res) => {
   try {
     const a = await UserAddress.findOneAndUpdate({ _id: req.params.id, user: req.session.userId }, req.body, { new: true });
     await logUserAction(`Address updated: ${a?.city}`, 'address', req);
     res.json(a);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'PUT /api/user/addresses/:id', e); }
 });
 app.delete('/api/user/addresses/:id', authOnly, async (req, res) => {
   try {
     await UserAddress.deleteOne({ _id: req.params.id, user: req.session.userId });
     await logUserAction(`Address deleted: ${req.params.id}`, 'address', req);
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'DELETE /api/user/addresses/:id', e); }
 });
 
 app.get('/api/user/payments', authOnly, async (req, res) => {
-  try { res.json(await PaymentMethod.find({ user: req.session.userId })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await PaymentMethod.find({ user: req.session.userId })); } catch (e) { apiError(res, 'GET /api/user/payments', e); }
 });
 app.post('/api/user/payments', authOnly, async (req, res) => {
   try {
@@ -984,7 +1037,7 @@ app.post('/api/user/payments', authOnly, async (req, res) => {
     const p = await PaymentMethod.create({ user: req.session.userId, cardLast4: cardNumber.slice(-4), cardholderName, expiryDate, cvv, isDefault: !!isDefault });
     await logUserAction(`Payment method added: ****${p.cardLast4}`, 'payment', req);
     res.json(p);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/payments', e); }
 });
 
 app.post('/api/user/bookings', authOnly, async (req, res) => {
@@ -992,7 +1045,7 @@ app.post('/api/user/bookings', authOnly, async (req, res) => {
     const b = await TableBooking.create({ ...req.body, user: req.session.userId });
     await logUserAction(`Table booked: ${b.date} ${b.time} for ${b.guests} guests`, 'booking', req);
     res.json(b);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/bookings', e); }
 });
 
 // Per-user notification fetch with individual read status
@@ -1015,7 +1068,7 @@ app.get('/api/user/notifications', authOnly, async (req, res) => {
     }));
 
     res.json(enriched);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/user/notifications', e); }
 });
 
 // Mark single notification read (per-user)
@@ -1035,7 +1088,7 @@ app.post('/api/user/notifications/:id/read', authOnly, async (req, res) => {
     );
 
     res.json({ success: true, isRead: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/notifications/:id/read', e); }
 });
 
 // Mark all notifications read (per-user)
@@ -1056,11 +1109,11 @@ app.post('/api/user/notifications/mark-all-read', authOnly, async (req, res) => 
     if (ops.length) await NotificationRead.bulkWrite(ops);
 
     res.json({ success: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/notifications/mark-all-read', e); }
 });
 
 app.get('/api/user/conversations', authOnly, async (req, res) => {
-  try { res.json(await Conversation.find({ user: req.session.userId }).sort({ createdAt: 1 })); } catch (e) { res.status(500).json({ message: e.message }); }
+  try { res.json(await Conversation.find({ user: req.session.userId }).sort({ createdAt: 1 })); } catch (e) { apiError(res, 'GET /api/user/conversations', e); }
 });
 app.post('/api/user/conversations', authOnly, async (req, res) => {
   try {
@@ -1073,7 +1126,7 @@ app.post('/api/user/conversations', authOnly, async (req, res) => {
     await logUserAction('Support message sent', 'support', req);
     io.emit('support:admin-feed', await Conversation.findById(m._id).populate('user').lean());
     res.json(m);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/conversations', e); }
 });
 app.post('/api/user/conversations/reaction', authOnly, async (req, res) => {
   try {
@@ -1087,7 +1140,7 @@ app.post('/api/user/conversations/reaction', authOnly, async (req, res) => {
     io.emit('support:admin-feed', await Conversation.findById(messageId).populate('user').lean());
     io.to(`user:${msg.user}`).emit('support:new-message', msg);
     res.json(msg);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/user/conversations/reaction', e); }
 });
 
 // =====================================================================
@@ -1102,7 +1155,15 @@ const storage = multer.diskStorage({
   filename:    (r, f, cb) => cb(null, Date.now() + '-' + f.originalname.replace(/[^a-zA-Z0-9._-]/g, '_'))
 });
 const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
-app.post('/api/upload', authOnly, upload.single('file'), (req, res) => {
+// multer errors (size limit, disk failures) would otherwise reach the default
+// express handler and return HTML that the JSON clients cannot read.
+const uploadSingle = (req, res, next) => upload.single('file')(req, res, (err) => {
+  if (!err) return next();
+  console.error('❌ POST /api/upload:', err.stack || err);
+  if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ message: 'File too large (max 20MB)' });
+  return res.status(400).json({ message: 'Upload failed: ' + (err.message || 'unknown error') });
+});
+app.post('/api/upload', authOnly, uploadSingle, (req, res) => {
   if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
   res.json({ fileUrl: '/uploads/' + req.file.filename, fileName: req.file.originalname, fileType: req.file.mimetype });
 });
@@ -1115,7 +1176,7 @@ app.post('/api/newsletter/subscribe', async (req, res) => {
     await Newsletter.create({ name: req.body.name || '', email: req.body.email || '' });
     await AdminLog.create({ action: `Newsletter subscribe: ${req.body.name || ''} ${req.body.email || ''}` });
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'POST /api/newsletter/subscribe', e); }
 });
 
 app.post('/api/translate', async (req, res) => {
@@ -1127,7 +1188,7 @@ app.post('/api/translate', async (req, res) => {
     const translated = (data?.[0] || []).map(x => x?.[0] || '').join('');
     return res.json({ translated });
   } catch (e) {
-    return res.status(500).json({ message: e.message });
+    return apiError(res, 'POST /api/translate', e);
   }
 });
 
@@ -1200,25 +1261,41 @@ async function buildChatContext(userId) {
   return { menuText, cartInfo, ordersInfo, wishlistInfo, notifInfo, bookingInfo };
 }
 
-async function callAI(providers, body, attempt = 0) {
-  if (attempt >= providers.length) throw new Error('All AI providers failed');
+async function callAI(providers, body, attempt = 0, failures = []) {
+  if (attempt >= providers.length) {
+    const err = new Error(`All AI providers failed — ${failures.join(' | ') || 'no providers configured'}`);
+    err.code = 'AI_UNAVAILABLE';
+    throw err;
+  }
   const p = providers[attempt];
+  const controller = new AbortController();
+  const timer      = setTimeout(() => controller.abort(), 15000);
   try {
-    const controller = new AbortController();
-    const timer      = setTimeout(() => controller.abort(), 15000);
     const resp = await fetch(p.url, {
       method: 'POST',
       headers: p.headers(p.key),
       body: JSON.stringify({ ...body, model: p.model }),
       signal: controller.signal
     });
-    clearTimeout(timer);
-    if (!resp.ok) { const t = await resp.text(); console.error(`${p.name} error:`, t); return callAI(providers, body, attempt + 1); }
+    if (!resp.ok) {
+      const t = await resp.text();
+      console.error(`${p.name} error (HTTP ${resp.status}):`, t.slice(0, 500));
+      return callAI(providers, body, attempt + 1, [...failures, `${p.name}: HTTP ${resp.status}`]);
+    }
     const data = await resp.json();
-    return data?.choices?.[0]?.message?.content || 'No response.';
+    const content = data?.choices?.[0]?.message?.content;
+    // an unexpected payload is a provider failure, not an empty answer
+    if (!content) {
+      console.error(`${p.name} returned an unexpected payload:`, JSON.stringify(data).slice(0, 500));
+      return callAI(providers, body, attempt + 1, [...failures, `${p.name}: unexpected payload`]);
+    }
+    return content;
   } catch (e) {
+    if (e.code === 'AI_UNAVAILABLE') throw e;
     console.error(`${p.name} failed:`, e.message);
-    return callAI(providers, body, attempt + 1);
+    return callAI(providers, body, attempt + 1, [...failures, `${p.name}: ${e.message}`]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1292,8 +1369,13 @@ ${context.menuText}
 
     res.json({ reply, sessionId: chatSession?._id });
   } catch (err) {
-    console.error('Chat error:', err);
-    res.json({ reply: 'Sorry, something went wrong. Please try again.' });
+    console.error('❌ POST /api/chat:', err?.stack || err);
+    const unavailable = err?.code === 'AI_UNAVAILABLE';
+    res.status(unavailable ? 503 : 500).json({
+      reply: unavailable
+        ? 'The assistant is temporarily unavailable. Please try again in a moment.'
+        : 'Sorry, something went wrong. Please try again.'
+    });
   }
 });
 
@@ -1302,7 +1384,9 @@ app.get('/api/chat/history', async (req, res) => {
     if (!req.session?.userId) return res.json([]);
     const sessions = await ChatSession.find({ user: req.session.userId }).sort({ updatedAt: -1 }).select('title updatedAt _id').lean();
     res.json(sessions);
-  } catch (e) { res.json([]); }
+  } catch (e) {
+    apiError(res, 'GET /api/chat/history', e, 'Failed to load chat history');
+  }
 });
 
 app.get('/api/chat/session/:id', async (req, res) => {
@@ -1311,7 +1395,7 @@ app.get('/api/chat/session/:id', async (req, res) => {
     const s = await ChatSession.findOne({ _id: req.params.id, user: req.session.userId }).lean();
     if (!s) return res.status(404).json({ message: 'Session not found' });
     res.json(s);
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'GET /api/chat/session/:id', e); }
 });
 
 app.delete('/api/chat/session/:id', async (req, res) => {
@@ -1319,10 +1403,29 @@ app.delete('/api/chat/session/:id', async (req, res) => {
     if (!req.session?.userId) return res.status(401).json({ message: 'Login required' });
     await ChatSession.deleteOne({ _id: req.params.id, user: req.session.userId });
     res.json({ ok: true });
-  } catch (e) { res.status(500).json({ message: e.message }); }
+  } catch (e) { apiError(res, 'DELETE /api/chat/session/:id', e); }
 });
 
 app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'home.html')));
+
+// =====================================================================
+// API 404 + LAST-RESORT ERROR HANDLER
+// Guarantees JSON (never HTML) for /api clients and makes sure no error
+// escapes a handler without being logged.
+// =====================================================================
+app.use('/api', (_req, res) => res.status(404).json({ message: 'Endpoint not found' }));
+
+app.use((err, req, res, _next) => {
+  if (err?.type === 'entity.too.large') {
+    console.error(`❌ ${req.method} ${req.originalUrl}: payload too large`);
+    return res.status(413).json({ message: 'Request payload too large' });
+  }
+  if (err instanceof SyntaxError && 'body' in err) {
+    console.error(`❌ ${req.method} ${req.originalUrl}: invalid JSON body`);
+    return res.status(400).json({ message: 'Invalid JSON body' });
+  }
+  return apiError(res, `${req.method} ${req.originalUrl}`, err);
+});
 
 // =====================================================================
 // SOCKET.IO
@@ -1345,6 +1448,7 @@ io.on('connection', (socket) => {
       io.emit('support:admin-feed', populated);
       io.emit('support:new-message', msg);
     } catch (e) {
+      console.error('❌ socket support:user-message:', e?.stack || e);
       socket.emit('support:error', { message: 'Failed to save message. Please try again.' });
     }
   });
@@ -1363,14 +1467,17 @@ io.on('connection', (socket) => {
       io.emit('support:admin-feed', msg);
       io.emit('support:new-message', msg);
     } catch (e) {
+      console.error('❌ socket support:admin-reply:', e?.stack || e);
       socket.emit('support:error', { message: 'Failed to save reply. Please try again.' });
     }
   });
 
   socket.on('support:reaction', async (payload) => {
     try {
+      if (!payload?.messageId || !mongoose.Types.ObjectId.isValid(payload.messageId))
+        return socket.emit('support:error', { message: 'Invalid message reference.' });
       const msg = await Conversation.findById(payload.messageId);
-      if (!msg) return;
+      if (!msg) return socket.emit('support:error', { message: 'Message not found.' });
       const existingIdx = msg.reactions.findIndex(r => String(r.by) === String(payload.userId) && r.type === payload.emoji);
       if (existingIdx >= 0) msg.reactions.splice(existingIdx, 1);
       else msg.reactions.push({ type: payload.emoji, by: payload.userId });
@@ -1379,6 +1486,7 @@ io.on('connection', (socket) => {
       io.emit('support:admin-feed', msg);
       io.emit('support:new-message', msg);
     } catch (e) {
+      console.error('❌ socket support:reaction:', e?.stack || e);
       socket.emit('support:error', { message: 'Failed to save reaction.' });
     }
   });
@@ -1396,32 +1504,14 @@ connectMongo().then(async () => {
   if (existingCategories === 0 && existingProducts === 0) {
     console.log('📦 Database empty. Auto-seeding food data from APIs...');
     try {
-      for (const [en, key, ar] of CATEGORIES_SEED) {
-        const apiUrl = `https://free-food-menus-api-two.vercel.app/${key}`;
-        let category = await Category.findOne({ apiUrl });
-        if (!category) {
-          const first = await fetch(apiUrl).then(r => r.json()).then(d => d[0]).catch(() => null);
-          category = await Category.create({
-            nameEn: en, nameAr: ar, apiUrl,
-            imageUrl: first?.img || CATEGORY_FALLBACK_IMAGES[key] || '',
-            isActive: true
-          });
-        }
-        if ((await Product.countDocuments({ category: category._id })) > 0) continue;
-        const data = await fetch(apiUrl).then(r => r.json()).catch(() => []);
-        const bulk = data.map(p => ({
-          name: p.name || p.dsc || en, description: p.dsc || '',
-          price: Number(p.price) || 0, originalPrice: Number(p.price) || 0,
-          category: category._id, imageUrl: p.img || '',
-          inStock: true, featured: false, onSale: false,
-          rating: Number(p.rate) || 0, reviewsCount: 0, reviews: [], sourceApi: apiUrl
-        }));
-        if (bulk.length) await Product.insertMany(bulk);
-      }
-      await writeLog('Auto-seeded food data on server start');
-      console.log('✅ Auto-seeding completed successfully');
+      const failed = await seedFoodData();
+      await writeLog(failed.length
+        ? `Auto-seed on server start finished with failed categories: ${failed.join(', ')}`
+        : 'Auto-seeded food data on server start');
+      if (failed.length) console.error(`⚠️ Auto-seeding incomplete — failed categories: ${failed.join(', ')}`);
+      else console.log('✅ Auto-seeding completed successfully');
     } catch (e) {
-      console.error('⚠️ Auto-seeding failed:', e.message);
+      console.error('⚠️ Auto-seeding failed:', e.stack || e);
     }
   } else {
     console.log(`📊 Database has ${existingCategories} categories and ${existingProducts} products`);

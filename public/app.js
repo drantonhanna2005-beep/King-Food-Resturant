@@ -25,8 +25,10 @@ function showToast(message, kind = 'success') {
 }
 async function postJSON(url, payload) {
   const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.message || 'Request failed');
+  // a non-JSON response (proxy/gateway error page) must not surface as an
+  // opaque "Unexpected token" parse error
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || `Request failed (HTTP ${res.status})`);
   return data;
 }
 function scorePassword(pwd) {

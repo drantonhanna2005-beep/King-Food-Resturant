@@ -137,7 +137,8 @@
                         });
                     });
                 } catch (error) {
-                    document.getElementById('ordersList').innerHTML = '<p class="text-danger">Error loading orders</p>';
+                    console.error('Loading orders failed:', error);
+                    renderLoadError(document.getElementById('ordersList'), error, 'orders');
                 }
             };
 

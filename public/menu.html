@@ -629,14 +629,11 @@ function buildTicker() {
 
 /* ── FETCH ── */
 async function fetchCategory(key) {
-  try {
-    const r = await fetch(`${BASE}/${key}`);
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return await r.json();
-  } catch (e) {
-    console.warn('Failed to fetch', key, e);
-    return [];
-  }
+  const r = await fetch(`${BASE}/${key}`);
+  if (!r.ok) throw new Error(`HTTP ${r.status} for category "${key}"`);
+  const data = await r.json();
+  if (!Array.isArray(data)) throw new Error(`Unexpected payload for category "${key}"`);
+  return data;
 }
 
 function deduplicateItems(items) {
@@ -911,10 +908,21 @@ function renderCatTabs() {
 async function init() {
   buildTicker();
   try {
-    const results = await Promise.all(CATS_UNIQUE.map(c => fetchCategory(c.key)));
+    // per-category failures must not look like empty categories, and one bad
+    // category must not blank out the whole menu
+    const results = await Promise.allSettled(CATS_UNIQUE.map(c => fetchCategory(c.key)));
+    const failed = [];
     CATS_UNIQUE.forEach((c, i) => {
-      allData[c.key] = deduplicateItems(results[i] || []);
+      const r = results[i];
+      if (r.status === 'fulfilled') {
+        allData[c.key] = deduplicateItems(r.value);
+      } else {
+        console.error(`Failed to load category "${c.key}":`, r.reason);
+        allData[c.key] = [];
+        failed.push(c.key);
+      }
     });
+    if (failed.length === CATS_UNIQUE.length) throw new Error('No menu category could be loaded');
 
     computePriceRange(allData);
 
@@ -927,6 +935,12 @@ async function init() {
     renderMenuMain();
     updateConfirmBar();
 
+    if (failed.length) {
+      const notice = document.createElement('div');
+      notice.className = 'error-msg';
+      notice.textContent = `Some categories could not be loaded (${failed.join(', ')}). Please refresh to try again.`;
+      document.getElementById('dealsGrid').before(notice);
+    }
   } catch (err) {
     document.getElementById('dealsGrid').innerHTML =
       `<div class="error-msg">Failed to load data. Please check your internet connection.</div>`;

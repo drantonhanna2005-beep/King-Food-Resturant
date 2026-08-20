@@ -123,13 +123,21 @@
       (async function hideLoaderWhenReady() {
         const loader = document.getElementById('globalLoader');
         if (!loader) return;
+        const warmUp = async (url) => {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`${url} failed (HTTP ${res.status})`);
+          return res.json();
+        };
         try {
           // Wait for categories + products to load
           await Promise.all([
-            fetch('/api/store/categories').then(r => r.json()),
-            fetch('/api/store/products').then(r => r.json())
+            warmUp('/api/store/categories'),
+            warmUp('/api/store/products')
           ]);
-        } catch(e){}
+        } catch (e) {
+          // site.js renders the visible error in the grid; never fail silently here
+          console.error('Initial menu load failed:', e);
+        }
         // Small delay for smooth transition
         setTimeout(() => {
           loader.style.transition = 'opacity 0.4s ease';

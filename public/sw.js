@@ -52,8 +52,15 @@ self.addEventListener('fetch', (event) => {
   // إذا كان الطلب للـ API، استخدم الشبكة مع fallback للـ cache
   if (event.request.url.includes('/api/')) {
     event.respondWith(
-      fetch(event.request)
-        .catch(() => caches.match(event.request))
+      fetch(event.request).catch(async (err) => {
+        console.warn('⚠️ Service Worker: API request failed:', event.request.url, err);
+        const cached = await caches.match(event.request);
+        // respondWith(undefined) would surface as an unreadable network error
+        return cached || new Response(
+          JSON.stringify({ message: 'You appear to be offline. Please check your connection.' }),
+          { status: 503, headers: { 'Content-Type': 'application/json' } }
+        );
+      })
     );
     return;
   }
@@ -62,6 +69,9 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     caches.match(event.request)
       .then((cached) => cached || fetch(event.request))
-      .catch(() => new Response('Offline'))
+      .catch((err) => {
+        console.warn('⚠️ Service Worker: asset request failed:', event.request.url, err);
+        return new Response('Offline', { status: 503, headers: { 'Content-Type': 'text/plain' } });
+      })
   );
 });

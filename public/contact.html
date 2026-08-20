@@ -139,7 +139,11 @@
           try {
             orderItems = JSON.parse(stored);
             localStorage.removeItem('bookingOrderItems');
-          } catch(e) { orderItems = []; }
+          } catch(e) {
+            // corrupt local draft: start empty, but do not hide the reason
+            console.error('Stored booking order items could not be parsed:', e);
+            orderItems = [];
+          }
         }
       }
       
