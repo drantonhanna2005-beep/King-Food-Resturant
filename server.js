@@ -5,6 +5,7 @@ const session = require('express-session');
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -46,10 +47,14 @@ const { Server } = require('socket.io');
 const io = new Server(server);
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
-const ADMIN_EMAIL = 'admin2030@gmail.com';
-const ADMIN_PASSWORD = 'Admin2030KingFood';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').toLowerCase();
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const SESSION_SECRET = process.env.SESSION_SECRET;
 
 if (!MONGO_URI) throw new Error('MONGO_URI is required.');
+if (!SESSION_SECRET) throw new Error('SESSION_SECRET is required.');
+if (IS_PRODUCTION && SESSION_SECRET.length < 32) throw new Error('SESSION_SECRET must be at least 32 characters.');
 
 mongoose.set('strictQuery', false);
 
@@ -202,7 +207,7 @@ const addressSchema = new mongoose.Schema(
   { timestamps: true }
 );
 const paymentSchema = new mongoose.Schema(
-  { user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, cardLast4: String, cardholderName: String, expiryDate: String, cvv: String, isDefault: Boolean },
+  { user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, cardLast4: String, cardholderName: String, expiryDate: String, isDefault: Boolean },
   { timestamps: true }
 );
 const wishlistSchema = new mongoose.Schema(
@@ -287,19 +292,66 @@ const ChatSession = mongoose.model('ChatSession', chatSessionSchema);
 const UserTourState = mongoose.model('UserTourState', userTourStateSchema);
 const NotificationRead = mongoose.model('NotificationRead', notificationReadSchema);
 
+app.set('trust proxy', 1);
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
-app.use(
-  session({
-    secret: process.env.SESSION_SECRET || 'dev_secret_change_me',
-    resave: false,
-    saveUninitialized: false,
-    cookie: { httpOnly: true, maxAge: 1000 * 60 * 60 * 2 }
-  })
-);
+const sessionMiddleware = session({
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { httpOnly: true, sameSite: 'lax', secure: IS_PRODUCTION, maxAge: 1000 * 60 * 60 * 2 }
+});
+app.use(sessionMiddleware);
 app.use(express.static(path.join(__dirname, 'public')));
 
 const passwordRule = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,}$/;
+
+// Only accept primitive strings from request bodies so that objects such as
+// `{ "$ne": null }` can never reach a Mongo query operator position.
+function asString(value) {
+  return typeof value === 'string' ? value : '';
+}
+
+function asObjectId(value) {
+  const id = asString(value);
+  return mongoose.Types.ObjectId.isValid(id) ? id : null;
+}
+
+function pick(source, fields) {
+  const out = {};
+  if (!source || typeof source !== 'object') return out;
+  for (const field of fields) {
+    if (source[field] !== undefined) out[field] = source[field];
+  }
+  return out;
+}
+
+// Fixed-window in-memory limiter. Enough to stop credential stuffing and AI
+// endpoint abuse on a single-instance deployment.
+function rateLimit({ windowMs, max, message }) {
+  const hits = new Map();
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+    const entry = hits.get(key);
+    if (!entry || now - entry.start > windowMs) {
+      hits.set(key, { start: now, count: 1 });
+      return next();
+    }
+    entry.count += 1;
+    if (entry.count > max) return res.status(429).json({ message });
+    return next();
+  };
+}
+
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, message: 'Too many attempts. Try again later.' });
+const chatLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 60, message: 'Too many chat requests. Try again later.' });
 
 const CATEGORIES_SEED = [
   ['بيتزا 🍕', 'pizzas', 'بيتزا'],
@@ -338,6 +390,7 @@ async function logUserAction(action, actionType, req) {
 }
 
 async function ensureAdminUser() {
+  if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return null;
   let admin = await User.findOne({ email: ADMIN_EMAIL });
   if (!admin) {
     admin = await User.create({
@@ -349,6 +402,13 @@ async function ensureAdminUser() {
     });
   }
   return admin;
+}
+
+function mailTransport() {
+  const user = process.env.SMTP_USER || process.env.GMAIL_USER;
+  const pass = process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD;
+  if (!user || !pass) return null;
+  return { user, transporter: nodemailer.createTransport({ service: 'gmail', auth: { user, pass } }) };
 }
 
 function adminOnly(req, res, next) {
@@ -366,16 +426,20 @@ function authOnly(req, res, next) {
 // =====================================================================
 // AUTH ROUTES
 // =====================================================================
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', authLimiter, async (req, res) => {
   try {
-    const { firstName, lastName, email, password, repeatPassword } = req.body;
+    const firstName      = asString(req.body.firstName).trim();
+    const lastName       = asString(req.body.lastName).trim();
+    const email          = asString(req.body.email).trim().toLowerCase();
+    const password       = asString(req.body.password);
+    const repeatPassword = asString(req.body.repeatPassword);
     if (!firstName || !lastName || !email || !password || !repeatPassword)
       return res.status(400).json({ message: 'All fields required' });
     if (!passwordRule.test(password))
       return res.status(400).json({ message: 'Weak password' });
     if (password !== repeatPassword)
       return res.status(400).json({ message: 'Passwords do not match' });
-    if (await User.findOne({ email: email.toLowerCase() }))
+    if (await User.findOne({ email }))
       return res.status(409).json({ message: 'already exist' });
 
     await User.create({ firstName, lastName, email, passwordHash: await bcrypt.hash(password, 10), role: 'user' });
@@ -387,15 +451,18 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', authLimiter, async (req, res) => {
   try {
-    const { email = '', password = '', rememberMe } = req.body;
+    const email      = asString(req.body.email).trim().toLowerCase();
+    const password   = asString(req.body.password);
+    const rememberMe = req.body.rememberMe === true;
     await ensureAdminUser();
 
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(401).json({ message: 'Invalid credentials' });
+    const user = await User.findOne({ email });
+    if (!user || !user.passwordHash) return res.status(401).json({ message: 'Invalid credentials' });
     if (!(await bcrypt.compare(password, user.passwordHash)))
       return res.status(401).json({ message: 'Invalid credentials' });
+    if (user.isActive === false) return res.status(403).json({ message: 'Account disabled' });
 
     req.session.userId = String(user._id);
     req.session.role   = user.role;
@@ -410,31 +477,50 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-app.post('/api/forgot-password', async (req, res) => {
+app.post('/api/forgot-password', authLimiter, async (req, res) => {
+  const genericResponse = { message: 'If the account exists a reset code has been sent by email' };
   try {
-    const { email } = req.body;
-    const user = await User.findOne({ email: (email || '').toLowerCase() });
-    if (!user) return res.json({ message: 'If account exists reset code sent' });
+    const email = asString(req.body.email).trim().toLowerCase();
+    const user  = email ? await User.findOne({ email }) : null;
+    if (!user) return res.json(genericResponse);
 
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const code = String(crypto.randomInt(100000, 1000000));
     user.resetCodeHash      = await bcrypt.hash(code, 10);
     user.resetCodeExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
     await user.save();
-    res.json({ message: 'Demo mode: reset code generated', resetCode: code });
+
+    const mail = mailTransport();
+    if (mail) {
+      await mail.transporter.sendMail({
+        from: mail.user,
+        to: user.email,
+        subject: 'King Food password reset code',
+        text: `Your password reset code is ${code}. It expires in 10 minutes.`
+      });
+    } else if (!IS_PRODUCTION) {
+      console.log(`[dev] password reset code for ${user.email}: ${code}`);
+    } else {
+      console.error('SMTP is not configured — reset code could not be delivered.');
+    }
+    res.json(genericResponse);
   } catch (e) {
-    res.status(500).json({ message: 'Failed' });
+    console.error('Forgot password error:', e.message);
+    res.json(genericResponse);
   }
 });
 
-app.post('/api/reset-password', async (req, res) => {
+app.post('/api/reset-password', authLimiter, async (req, res) => {
   try {
-    const { email, code, newPassword, repeatPassword } = req.body;
-    const user = await User.findOne({ email: (email || '').toLowerCase() });
+    const email          = asString(req.body.email).trim().toLowerCase();
+    const code           = asString(req.body.code);
+    const newPassword    = asString(req.body.newPassword);
+    const repeatPassword = asString(req.body.repeatPassword);
+    const user = email ? await User.findOne({ email }) : null;
     if (!user || !user.resetCodeHash || new Date() > user.resetCodeExpiresAt)
       return res.status(400).json({ message: 'Invalid/expired code' });
-    if (!(await bcrypt.compare(code || '', user.resetCodeHash)))
+    if (!(await bcrypt.compare(code, user.resetCodeHash)))
       return res.status(400).json({ message: 'Invalid code' });
-    if (!passwordRule.test(newPassword || ''))
+    if (!passwordRule.test(newPassword))
       return res.status(400).json({ message: 'Weak password' });
     if (newPassword !== repeatPassword)
       return res.status(400).json({ message: 'Passwords do not match' });
@@ -547,13 +633,12 @@ app.post('/api/admin/users/:id/send-email', adminOnly, async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
     if (!user?.email) return res.status(404).json({ message: 'User email not found' });
-    const { subject, message } = req.body;
-    const smtpUser = process.env.SMTP_USER || process.env.GMAIL_USER;
-    const smtpPass = process.env.SMTP_PASS || process.env.GMAIL_APP_PASSWORD;
-    if (!smtpUser || !smtpPass)
+    const subject = asString(req.body.subject);
+    const message = asString(req.body.message);
+    const mail = mailTransport();
+    if (!mail)
       return res.status(400).json({ message: 'SMTP credentials missing. Add SMTP_USER + SMTP_PASS in .env' });
-    const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: smtpUser, pass: smtpPass } });
-    await transporter.sendMail({ from: smtpUser, to: user.email, subject: subject || 'Message from King Food Admin', text: message || '' });
+    await mail.transporter.sendMail({ from: mail.user, to: user.email, subject: subject || 'Message from King Food Admin', text: message });
     await writeLog(`Email sent to ${user.email}: ${subject || 'No subject'}`);
     res.json({ message: `Email sent successfully to ${user.email}` });
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -591,7 +676,7 @@ app.post('/api/admin/notifications', adminOnly, async (req, res) => {
 });
 
 // Admin: get notifications with per-user read counts
-app.get('/api/admin/notifications', adminOnly, async (_req, res) => {
+app.get('/api/admin/notifications/read-counts', adminOnly, async (_req, res) => {
   try {
     const notifs = await Notification.find().populate('user').sort({ createdAt: -1 }).lean();
     const notifIds = notifs.map(n => n._id);
@@ -677,20 +762,24 @@ app.get('/api/admin/conversations', adminOnly, async (_req, res) => {
 });
 app.post('/api/admin/conversations/reply', adminOnly, async (req, res) => {
   try {
+    const targetUserId = asObjectId(req.body.userId);
+    if (!targetUserId) return res.status(400).json({ message: 'Invalid user id' });
     const m = await Conversation.create({
-      user: req.body.userId, senderRole: 'admin',
-      message: req.body.message || '', imageUrl: req.body.imageUrl || '',
-      fileUrl: req.body.fileUrl || '', fileName: req.body.fileName || '',
-      fileType: req.body.fileType || '', replyTo: req.body.replyTo || null
+      user: targetUserId, senderRole: 'admin',
+      message: asString(req.body.message), imageUrl: asString(req.body.imageUrl),
+      fileUrl: asString(req.body.fileUrl), fileName: asString(req.body.fileName),
+      fileType: asString(req.body.fileType), replyTo: asObjectId(req.body.replyTo)
     });
     await logUserAction('Admin replied to support chat', 'support', req);
-    io.to(`user:${req.body.userId}`).emit('support:new-message', m);
+    io.to(`user:${targetUserId}`).emit('support:new-message', m);
     res.json(m);
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 app.post('/api/admin/conversations/reaction', adminOnly, async (req, res) => {
   try {
-    const { messageId, emoji } = req.body;
+    const messageId = asObjectId(req.body.messageId);
+    const emoji     = asString(req.body.emoji).slice(0, 16);
+    if (!messageId || !emoji) return res.status(400).json({ message: 'Invalid reaction' });
     const msg = await Conversation.findById(messageId);
     if (!msg) return res.status(404).json({ message: 'Message not found' });
     const existingIdx = msg.reactions.findIndex(r => String(r.by) === String(req.session.userId) && r.type === emoji);
@@ -698,7 +787,7 @@ app.post('/api/admin/conversations/reaction', adminOnly, async (req, res) => {
     else msg.reactions.push({ type: emoji, by: req.session.userId });
     await msg.save();
     io.to(`user:${msg.user}`).emit('support:new-message', msg);
-    io.emit('support:admin-feed', msg);
+    io.to('admins').emit('support:admin-feed', msg);
     res.json(msg);
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
@@ -736,8 +825,9 @@ app.get('/api/user/profile', authOnly, async (req, res) => {
 app.put('/api/user/profile', authOnly, async (req, res) => {
   try {
     const u = await UserProfile.findOne({ user: req.session.userId });
+    const update = pick(req.body, ['fullName', 'email', 'phone', 'dob', 'gender', 'photoUrl']);
     await logUserAction(`Profile updated: ${u?.email || req.session.email}`, 'profile', req);
-    res.json(await UserProfile.findOneAndUpdate({ user: req.session.userId }, req.body, { new: true, upsert: true }));
+    res.json(await UserProfile.findOneAndUpdate({ user: req.session.userId }, update, { new: true, upsert: true }));
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -746,7 +836,8 @@ app.get('/api/user/wishlist', authOnly, async (req, res) => {
 });
 app.post('/api/user/wishlist/toggle', authOnly, async (req, res) => {
   try {
-    const { productId } = req.body;
+    const productId = asObjectId(req.body.productId);
+    if (!productId) return res.status(400).json({ message: 'Invalid product id' });
     const ex = await Wishlist.findOne({ user: req.session.userId, product: productId });
     if (ex) { await ex.deleteOne(); await logUserAction(`Removed from wishlist: ${productId}`, 'wishlist', req); return res.json({ liked: false }); }
     await Wishlist.create({ user: req.session.userId, product: productId });
@@ -764,7 +855,9 @@ app.get('/api/user/cart', authOnly, async (req, res) => {
 });
 app.post('/api/user/cart', authOnly, async (req, res) => {
   try {
-    const { productId, qty } = req.body;
+    const productId = asObjectId(req.body.productId);
+    const qty = Math.max(1, Math.min(999, Number(req.body.qty) || 1));
+    if (!productId) return res.status(400).json({ message: 'Invalid product id' });
     let c = await Cart.findOne({ user: req.session.userId });
     if (!c) c = await Cart.create({ user: req.session.userId, items: [] });
     const idx = c.items.findIndex(i => String(i.product) === String(productId));
@@ -777,11 +870,13 @@ app.post('/api/user/cart', authOnly, async (req, res) => {
 });
 app.put('/api/user/cart/qty', authOnly, async (req, res) => {
   try {
-    const { productId, delta } = req.body;
+    const productId = asObjectId(req.body.productId);
+    const delta = Number(req.body.delta) || 0;
+    if (!productId) return res.status(400).json({ message: 'Invalid product id' });
     const c = await Cart.findOne({ user: req.session.userId }).populate('items.product');
     if (!c) return res.json({});
     const it = c.items.find(i => String(i.product._id || i.product) === String(productId));
-    if (it) { const stock = it.product.inStock ? 999 : 0; it.qty = Math.max(1, Math.min(stock, it.qty + Number(delta || 0))); }
+    if (it) { const stock = it.product.inStock ? 999 : 0; it.qty = Math.max(1, Math.min(stock, it.qty + delta)); }
     await c.save();
     await logUserAction(`Cart qty updated: product=${productId} delta=${delta}`, 'cart', req);
     res.json(c);
@@ -789,8 +884,8 @@ app.put('/api/user/cart/qty', authOnly, async (req, res) => {
 });
 app.post('/api/user/cart/apply-coupon', authOnly, async (req, res) => {
   try {
-    const rawCode = (req.body.code || '').trim();
-    if (!rawCode) return res.status(400).json({ message: 'Code is required' });
+    const rawCode = asString(req.body.code).trim();
+    if (!rawCode || rawCode.length > 64) return res.status(400).json({ message: 'Code is required' });
 
     const coupon = await Coupon.findOne({
       code: { $regex: new RegExp(`^${rawCode.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') },
@@ -831,7 +926,8 @@ app.post('/api/user/cart/apply-coupon', authOnly, async (req, res) => {
 });
 app.delete('/api/user/cart', authOnly, async (req, res) => {
   try {
-    const { productId } = req.body;
+    const productId = asObjectId(req.body.productId);
+    if (!productId) return res.status(400).json({ message: 'Invalid product id' });
     const c = await Cart.findOne({ user: req.session.userId });
     if (!c) return res.json({ items: [] });
     c.items = c.items.filter(i => String(i.product) !== String(productId));
@@ -938,10 +1034,12 @@ app.get('/api/user/orders', authOnly, async (req, res) => {
 app.get('/api/user/addresses', authOnly, async (req, res) => {
   try { res.json(await UserAddress.find({ user: req.session.userId }).sort({ createdAt: -1 })); } catch (e) { res.status(500).json({ message: e.message }); }
 });
+const ADDRESS_FIELDS = ['type', 'fullName', 'phone', 'streetAddress', 'city', 'zipCode', 'country', 'notes', 'isDefault'];
+
 app.post('/api/user/addresses', authOnly, async (req, res) => {
   try {
     if (req.body.isDefault) await UserAddress.updateMany({ user: req.session.userId }, { isDefault: false });
-    const a = await UserAddress.create({ ...req.body, user: req.session.userId });
+    const a = await UserAddress.create({ ...pick(req.body, ADDRESS_FIELDS), user: req.session.userId });
     await logUserAction(`Address added: ${a.city}`, 'address', req);
     res.json(a);
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -949,14 +1047,16 @@ app.post('/api/user/addresses', authOnly, async (req, res) => {
 app.put('/api/user/addresses/default', authOnly, async (req, res) => {
   try {
     await UserAddress.updateMany({ user: req.session.userId }, { isDefault: false });
-    await UserAddress.findOneAndUpdate({ _id: req.body.id, user: req.session.userId }, { isDefault: true });
+    const addressId = asObjectId(req.body.id);
+    if (!addressId) return res.status(400).json({ message: 'Invalid address id' });
+    await UserAddress.findOneAndUpdate({ _id: addressId, user: req.session.userId }, { isDefault: true });
     await logUserAction(`Default address changed: ${req.body.id}`, 'address', req);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 app.put('/api/user/addresses/:id', authOnly, async (req, res) => {
   try {
-    const a = await UserAddress.findOneAndUpdate({ _id: req.params.id, user: req.session.userId }, req.body, { new: true });
+    const a = await UserAddress.findOneAndUpdate({ _id: req.params.id, user: req.session.userId }, pick(req.body, ADDRESS_FIELDS), { new: true });
     await logUserAction(`Address updated: ${a?.city}`, 'address', req);
     res.json(a);
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -974,14 +1074,20 @@ app.get('/api/user/payments', authOnly, async (req, res) => {
 });
 app.post('/api/user/payments', authOnly, async (req, res) => {
   try {
-    const { cardNumber, cardholderName, expiryDate, cvv, isDefault } = req.body;
+    const cardNumber     = asString(req.body.cardNumber);
+    const cardholderName = asString(req.body.cardholderName);
+    const expiryDate     = asString(req.body.expiryDate);
+    const cvv            = asString(req.body.cvv);
+    const isDefault      = req.body.isDefault === true;
     if (!/^\d{16}$/.test(cardNumber)) return res.status(400).json({ message: 'invalid card number' });
     if (!/^\d{3}$/.test(cvv))         return res.status(400).json({ message: 'invalid cvv' });
+    if (!/^\d{2}\/\d{2}$/.test(expiryDate)) return res.status(400).json({ message: 'invalid expiry' });
     const [m, y] = expiryDate.split('/').map(Number);
     const exp = new Date(2000 + y, m);
     if (exp <= new Date()) return res.status(400).json({ message: 'expiry must be future' });
     if (isDefault) await PaymentMethod.updateMany({ user: req.session.userId }, { isDefault: false });
-    const p = await PaymentMethod.create({ user: req.session.userId, cardLast4: cardNumber.slice(-4), cardholderName, expiryDate, cvv, isDefault: !!isDefault });
+    // The CVV is validated but never persisted (PCI DSS forbids storing it).
+    const p = await PaymentMethod.create({ user: req.session.userId, cardLast4: cardNumber.slice(-4), cardholderName, expiryDate, isDefault });
     await logUserAction(`Payment method added: ****${p.cardLast4}`, 'payment', req);
     res.json(p);
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -989,7 +1095,10 @@ app.post('/api/user/payments', authOnly, async (req, res) => {
 
 app.post('/api/user/bookings', authOnly, async (req, res) => {
   try {
-    const b = await TableBooking.create({ ...req.body, user: req.session.userId });
+    const b = await TableBooking.create({
+      ...pick(req.body, ['fullName', 'email', 'phone', 'date', 'time', 'guests', 'requests', 'orderItems']),
+      user: req.session.userId
+    });
     await logUserAction(`Table booked: ${b.date} ${b.time} for ${b.guests} guests`, 'booking', req);
     res.json(b);
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -1066,25 +1175,29 @@ app.post('/api/user/conversations', authOnly, async (req, res) => {
   try {
     const m = await Conversation.create({
       user: req.session.userId, senderRole: 'user',
-      message: req.body.message || '', imageUrl: req.body.imageUrl || '',
-      fileUrl: req.body.fileUrl || '', fileName: req.body.fileName || '',
-      fileType: req.body.fileType || '', replyTo: req.body.replyTo || null
+      message: asString(req.body.message), imageUrl: asString(req.body.imageUrl),
+      fileUrl: asString(req.body.fileUrl), fileName: asString(req.body.fileName),
+      fileType: asString(req.body.fileType), replyTo: asObjectId(req.body.replyTo)
     });
     await logUserAction('Support message sent', 'support', req);
-    io.emit('support:admin-feed', await Conversation.findById(m._id).populate('user').lean());
+    io.to('admins').emit('support:admin-feed', await Conversation.findById(m._id).populate('user').lean());
     res.json(m);
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 app.post('/api/user/conversations/reaction', authOnly, async (req, res) => {
   try {
-    const { messageId, emoji } = req.body;
+    const messageId = asObjectId(req.body.messageId);
+    const emoji     = asString(req.body.emoji).slice(0, 16);
+    if (!messageId || !emoji) return res.status(400).json({ message: 'Invalid reaction' });
     const msg = await Conversation.findById(messageId);
     if (!msg) return res.status(404).json({ message: 'Message not found' });
+    if (String(msg.user) !== String(req.session.userId) && req.session.role !== 'admin')
+      return res.status(403).json({ message: 'Forbidden' });
     const existingIdx = msg.reactions.findIndex(r => String(r.by) === String(req.session.userId) && r.type === emoji);
     if (existingIdx >= 0) msg.reactions.splice(existingIdx, 1);
     else msg.reactions.push({ type: emoji, by: req.session.userId });
     await msg.save();
-    io.emit('support:admin-feed', await Conversation.findById(messageId).populate('user').lean());
+    io.to('admins').emit('support:admin-feed', await Conversation.findById(messageId).populate('user').lean());
     io.to(`user:${msg.user}`).emit('support:new-message', msg);
     res.json(msg);
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -1097,14 +1210,36 @@ const multer    = require('multer');
 const fs        = require('fs');
 const uploadDir = path.join(__dirname, 'public', 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+// Uploads land in a statically served directory, so restrict them to inert
+// media types — HTML/SVG/JS would otherwise execute on our own origin.
+const ALLOWED_UPLOAD_TYPES = new Map([
+  ['image/jpeg', '.jpg'],
+  ['image/png', '.png'],
+  ['image/gif', '.gif'],
+  ['image/webp', '.webp'],
+  ['application/pdf', '.pdf']
+]);
 const storage = multer.diskStorage({
   destination: (r, f, cb) => cb(null, uploadDir),
-  filename:    (r, f, cb) => cb(null, Date.now() + '-' + f.originalname.replace(/[^a-zA-Z0-9._-]/g, '_'))
+  filename:    (r, f, cb) => {
+    const base = path.basename(f.originalname, path.extname(f.originalname)).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 60);
+    cb(null, `${Date.now()}-${base}${ALLOWED_UPLOAD_TYPES.get(f.mimetype) || ''}`);
+  }
 });
-const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
-app.post('/api/upload', authOnly, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
-  res.json({ fileUrl: '/uploads/' + req.file.filename, fileName: req.file.originalname, fileType: req.file.mimetype });
+const upload = multer({
+  storage,
+  limits: { fileSize: 20 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_UPLOAD_TYPES.has(file.mimetype)) return cb(new Error('Unsupported file type'));
+    cb(null, true);
+  }
+});
+app.post('/api/upload', authOnly, (req, res) => {
+  upload.single('file')(req, res, (err) => {
+    if (err) return res.status(400).json({ message: err.message });
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    res.json({ fileUrl: '/uploads/' + req.file.filename, fileName: req.file.originalname, fileType: req.file.mimetype });
+  });
 });
 
 // =====================================================================
@@ -1112,14 +1247,17 @@ app.post('/api/upload', authOnly, upload.single('file'), (req, res) => {
 // =====================================================================
 app.post('/api/newsletter/subscribe', async (req, res) => {
   try {
-    await Newsletter.create({ name: req.body.name || '', email: req.body.email || '' });
-    await AdminLog.create({ action: `Newsletter subscribe: ${req.body.name || ''} ${req.body.email || ''}` });
+    const name  = asString(req.body.name).slice(0, 120);
+    const email = asString(req.body.email).slice(0, 200);
+    await Newsletter.create({ name, email });
+    await AdminLog.create({ action: `Newsletter subscribe: ${name} ${email}` });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.post('/api/translate', async (req, res) => {
-  const { text = '', target = 'ar' } = req.body;
+  const text   = asString(req.body.text).slice(0, 5000);
+  const target = /^[a-zA-Z-]{2,8}$/.test(asString(req.body.target)) ? req.body.target : 'ar';
   if (!text.trim()) return res.json({ translated: '' });
   try {
     const url  = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(target)}&dt=t&q=${encodeURIComponent(text)}`;
@@ -1137,19 +1275,19 @@ app.post('/api/translate', async (req, res) => {
 const AI_PROVIDERS = [
   {
     name: 'eyegpt',
-    model: 'claude-opus-4-7',
-    url: 'https://api-eye-gpt.ahmedsalah.dev/v1/chat/completions',
-    key: 'egpt_o38X2JFrTd40bbtUZtjDOMympxnjms1ReE3wHwPKXN8',
+    model: process.env.EYEGPT_MODEL || 'claude-opus-4-7',
+    url: process.env.EYEGPT_URL || 'https://api-eye-gpt.ahmedsalah.dev/v1/chat/completions',
+    key: process.env.EYEGPT_API_KEY,
     headers: k => ({ 'Authorization': `Bearer ${k}`, 'Content-Type': 'application/json' })
   },
   {
     name: 'openrouter',
-    model: 'openai/gpt-3.5-turbo',
+    model: process.env.OPENROUTER_MODEL || 'openai/gpt-3.5-turbo',
     url: 'https://openrouter.ai/api/v1/chat/completions',
-    key: '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',
-    headers: k => ({ 'Authorization': `Bearer ${k}`, 'Content-Type': 'application/json', 'HTTP-Referer': 'http://localhost:3000', 'X-Title': 'King Food AI' })
+    key: process.env.OPENROUTER_API_KEY,
+    headers: k => ({ 'Authorization': `Bearer ${k}`, 'Content-Type': 'application/json', 'HTTP-Referer': process.env.PUBLIC_URL || 'http://localhost:3000', 'X-Title': 'King Food AI' })
   }
-];
+].filter(p => !!p.key);
 
 async function buildChatContext(userId) {
   const [allProducts, allCategories, cart, orders, wishlist, notifications, bookings] = await Promise.all([
@@ -1222,10 +1360,12 @@ async function callAI(providers, body, attempt = 0) {
   }
 }
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', chatLimiter, authOnly, async (req, res) => {
   try {
-    const { message, sessionId } = req.body;
+    const message   = asString(req.body.message).slice(0, 4000);
+    const sessionId = asObjectId(req.body.sessionId);
     if (!message) return res.status(400).json({ reply: 'Message is required.' });
+    if (!AI_PROVIDERS.length) return res.status(503).json({ reply: 'AI chat is not configured.' });
 
     const userId  = req.session?.userId;
     const context = await buildChatContext(userId);
@@ -1327,57 +1467,76 @@ app.get('/', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'home.ht
 // =====================================================================
 // SOCKET.IO
 // =====================================================================
-io.on('connection', (socket) => {
-  socket.on('join-user-room', (userId) => socket.join(`user:${userId}`));
+// Socket identity always comes from the express session, never from the
+// client payload, so a socket cannot post as another user or as an admin.
+io.engine.use(sessionMiddleware);
 
-  socket.on('support:user-message', async (payload) => {
+io.use((socket, next) => {
+  const sess = socket.request.session;
+  if (!sess?.userId) return next(new Error('unauthorized'));
+  socket.data.userId = String(sess.userId);
+  socket.data.role   = sess.role;
+  next();
+});
+
+io.on('connection', (socket) => {
+  const { userId, role } = socket.data;
+  const isAdmin = role === 'admin';
+  socket.join(`user:${userId}`);
+  if (isAdmin) socket.join('admins');
+
+  socket.on('join-user-room', (targetUserId) => {
+    if (isAdmin && mongoose.Types.ObjectId.isValid(String(targetUserId))) socket.join(`user:${targetUserId}`);
+  });
+
+  socket.on('support:user-message', async (payload = {}) => {
     try {
-      if (!payload.userId || !mongoose.Types.ObjectId.isValid(payload.userId))
-        return socket.emit('support:error', { message: 'Invalid user session. Please login again.' });
       const msg = await Conversation.create({
-        user: payload.userId, senderRole: 'user',
-        message: payload.message || '', imageUrl: payload.imageUrl || '',
-        fileUrl: payload.fileUrl || '', fileName: payload.fileName || '',
-        fileType: payload.fileType || '', replyTo: payload.replyTo || null
+        user: userId, senderRole: 'user',
+        message: asString(payload.message), imageUrl: asString(payload.imageUrl),
+        fileUrl: asString(payload.fileUrl), fileName: asString(payload.fileName),
+        fileType: asString(payload.fileType), replyTo: asObjectId(payload.replyTo)
       });
       const populated = await Conversation.findById(msg._id).populate('user').lean();
-      io.to(`user:${payload.userId}`).emit('support:new-message', msg);
-      io.emit('support:admin-feed', populated);
-      io.emit('support:new-message', msg);
+      io.to(`user:${userId}`).emit('support:new-message', msg);
+      io.to('admins').emit('support:admin-feed', populated);
     } catch (e) {
       socket.emit('support:error', { message: 'Failed to save message. Please try again.' });
     }
   });
 
-  socket.on('support:admin-reply', async (payload) => {
+  socket.on('support:admin-reply', async (payload = {}) => {
     try {
-      if (!payload.userId || !mongoose.Types.ObjectId.isValid(payload.userId))
-        return socket.emit('support:error', { message: 'Invalid target user.' });
+      if (!isAdmin) return socket.emit('support:error', { message: 'Admin access required.' });
+      const targetUserId = asObjectId(payload.userId);
+      if (!targetUserId) return socket.emit('support:error', { message: 'Invalid target user.' });
       const msg = await Conversation.create({
-        user: payload.userId, senderRole: 'admin',
-        message: payload.message || '', imageUrl: payload.imageUrl || '',
-        fileUrl: payload.fileUrl || '', fileName: payload.fileName || '',
-        fileType: payload.fileType || '', replyTo: payload.replyTo || null
+        user: targetUserId, senderRole: 'admin',
+        message: asString(payload.message), imageUrl: asString(payload.imageUrl),
+        fileUrl: asString(payload.fileUrl), fileName: asString(payload.fileName),
+        fileType: asString(payload.fileType), replyTo: asObjectId(payload.replyTo)
       });
-      io.to(`user:${payload.userId}`).emit('support:new-message', msg);
-      io.emit('support:admin-feed', msg);
-      io.emit('support:new-message', msg);
+      io.to(`user:${targetUserId}`).emit('support:new-message', msg);
+      io.to('admins').emit('support:admin-feed', msg);
     } catch (e) {
       socket.emit('support:error', { message: 'Failed to save reply. Please try again.' });
     }
   });
 
-  socket.on('support:reaction', async (payload) => {
+  socket.on('support:reaction', async (payload = {}) => {
     try {
-      const msg = await Conversation.findById(payload.messageId);
+      const messageId = asObjectId(payload.messageId);
+      const emoji     = asString(payload.emoji).slice(0, 16);
+      if (!messageId || !emoji) return;
+      const msg = await Conversation.findById(messageId);
       if (!msg) return;
-      const existingIdx = msg.reactions.findIndex(r => String(r.by) === String(payload.userId) && r.type === payload.emoji);
+      if (String(msg.user) !== userId && !isAdmin) return;
+      const existingIdx = msg.reactions.findIndex(r => String(r.by) === userId && r.type === emoji);
       if (existingIdx >= 0) msg.reactions.splice(existingIdx, 1);
-      else msg.reactions.push({ type: payload.emoji, by: payload.userId });
+      else msg.reactions.push({ type: emoji, by: userId });
       await msg.save();
-      io.to(`user:${payload.targetUserId || msg.user}`).emit('support:new-message', msg);
-      io.emit('support:admin-feed', msg);
-      io.emit('support:new-message', msg);
+      io.to(`user:${msg.user}`).emit('support:new-message', msg);
+      io.to('admins').emit('support:admin-feed', msg);
     } catch (e) {
       socket.emit('support:error', { message: 'Failed to save reaction.' });
     }

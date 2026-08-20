@@ -2,6 +2,12 @@ let barChart;
 let pieChart;
 let adminSocket;
 
+// Everything rendered through innerHTML below can contain data submitted by
+// customers (names, emails, chat messages, file names), so it must be escaped.
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 async function api(url, options = {}) {
   const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
   const data = await res.json().catch(() => ({}));
@@ -37,14 +43,14 @@ function openModal(title, body, onSubmit) {
 async function loadAdminMeta() {
   const me = await api('/api/admin/me');
   currentAdminId = me._id;
-  document.getElementById('adminMeta').innerHTML = `${me.name}<br><small>${me.email}</small>`;
+  document.getElementById('adminMeta').innerHTML = `${esc(me.name)}<br><small>${esc(me.email)}</small>`;
 }
 
 async function renderCategories() {
   const rows = await api('/api/admin/categories');
   document.getElementById('categoriesBody').innerHTML = rows
     .map(
-      (c) => `<tr><td><img src="${c.imageUrl || 'https://via.placeholder.com/52'}" class="product-thumb"></td><td>${c.nameEn}</td><td>${c.nameAr}</td><td>${c.isActive ? 'Active' : 'Not active'}</td><td>
+      (c) => `<tr><td><img src="${esc(c.imageUrl || 'https://via.placeholder.com/52')}" class="product-thumb"></td><td>${esc(c.nameEn)}</td><td>${esc(c.nameAr)}</td><td>${c.isActive ? 'Active' : 'Not active'}</td><td>
 <button class="btn btn-sm btn-outline-primary" onclick="editCategory('${c._id}','${encodeURIComponent(c.nameEn)}','${encodeURIComponent(c.nameAr)}','${encodeURIComponent(c.imageUrl || '')}',${c.isActive})">Update</button>
 <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/categories/${c._id}')">Delete</button></td></tr>`
     )
@@ -65,7 +71,7 @@ async function renderProducts() {
   const rows = await api('/api/admin/products');
   document.getElementById('productsBody').innerHTML = rows
     .map(
-      (p) => `<tr><td><img src="${p.imageUrl || 'https://via.placeholder.com/52'}" class="product-thumb"> ${p.name}</td><td>${p.category?.nameEn || '-'}</td><td>$${Number(p.price || 0).toFixed(2)}</td><td>${p.inStock ? 'In Stock' : 'Out'}</td><td>${p.onSale ? 'On Sale' : 'Normal'}</td><td><button class="btn btn-sm btn-outline-primary" onclick="editProduct('${p._id}')">Update</button> <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/products/${p._id}')">Delete</button></td></tr>`
+      (p) => `<tr><td><img src="${esc(p.imageUrl || 'https://via.placeholder.com/52')}" class="product-thumb"> ${esc(p.name)}</td><td>${esc(p.category?.nameEn || '-')}</td><td>$${Number(p.price || 0).toFixed(2)}</td><td>${p.inStock ? 'In Stock' : 'Out'}</td><td>${p.onSale ? 'On Sale' : 'Normal'}</td><td><button class="btn btn-sm btn-outline-primary" onclick="editProduct('${p._id}')">Update</button> <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/products/${p._id}')">Delete</button></td></tr>`
     )
     .join('');
 }
@@ -86,7 +92,7 @@ window.editProduct = async function editProduct(id) {
 async function renderOrders() {
   const rows = await api('/api/admin/orders');
   document.getElementById('ordersBody').innerHTML = rows
-    .map((o) => `<tr><td>${o.orderNo || o._id.slice(-8)}</td><td>${o.customerName}<br><small>${o.customerEmail || ''}</small></td><td>${new Date(o.createdAt).toLocaleDateString()}</td><td>${(o.items || []).length}</td><td>$${Number(o.total || 0).toFixed(2)}</td><td><small>${o.shippingAddress || '-'}</small></td><td>${o.status}</td><td><select onchange="updOrderStatus('${o._id}', this.value)" class="form-select form-select-sm"><option ${o.status === 'processing' ? 'selected' : ''}>processing</option><option ${o.status === 'shipping' ? 'selected' : ''}>shipping</option><option ${o.status === 'delivered' ? 'selected' : ''}>delivered</option><option ${o.status === 'cancelled' ? 'selected' : ''}>cancelled</option></select><button class="btn btn-sm btn-outline-dark mt-1" onclick="viewOrder('${o._id}')">View</button></td></tr>`)
+    .map((o) => `<tr><td>${esc(o.orderNo || o._id.slice(-8))}</td><td>${esc(o.customerName)}<br><small>${esc(o.customerEmail)}</small></td><td>${new Date(o.createdAt).toLocaleDateString()}</td><td>${(o.items || []).length}</td><td>$${Number(o.total || 0).toFixed(2)}</td><td><small>${esc(o.shippingAddress || '-')}</small></td><td>${esc(o.status)}</td><td><select onchange="updOrderStatus('${o._id}', this.value)" class="form-select form-select-sm"><option ${o.status === 'processing' ? 'selected' : ''}>processing</option><option ${o.status === 'shipping' ? 'selected' : ''}>shipping</option><option ${o.status === 'delivered' ? 'selected' : ''}>delivered</option><option ${o.status === 'cancelled' ? 'selected' : ''}>cancelled</option></select><button class="btn btn-sm btn-outline-dark mt-1" onclick="viewOrder('${o._id}')">View</button></td></tr>`)
     .join('');
 }
 window.updOrderStatus = async (id, status) => {
@@ -95,14 +101,14 @@ window.updOrderStatus = async (id, status) => {
 };
 window.viewOrder = async (id) => {
   const o = (await api('/api/admin/orders')).find((x) => x._id === id);
-  const items = (o.items || []).map((i) => `<li>${i.name} x${i.qty} - $${i.price}</li>`).join('');
-  openModal('Order Details', `<div><b>Customer:</b> ${o.customerName} (${o.customerEmail})<br><b>Address:</b> ${o.shippingAddress || '-'}<br><b>Table Reservation:</b> ${o.tableReservation ? 'Yes' : 'No'}<ul>${items}</ul><b>Total:</b> $${o.total}</div>`, async () => {});
+  const items = (o.items || []).map((i) => `<li>${esc(i.name)} x${Number(i.qty)} - $${Number(i.price)}</li>`).join('');
+  openModal('Order Details', `<div><b>Customer:</b> ${esc(o.customerName)} (${esc(o.customerEmail)})<br><b>Address:</b> ${esc(o.shippingAddress || '-')}<br><b>Table Reservation:</b> ${o.tableReservation ? 'Yes' : 'No'}<ul>${items}</ul><b>Total:</b> $${o.total}</div>`, async () => {});
 };
 
 async function renderUsers() {
   const rows = await api('/api/admin/users');
   document.getElementById('usersBody').innerHTML = rows
-    .map((u) => `<tr><td>${u.name}<br><small>${u.email}</small></td><td>${u.role}</td><td>${new Date(u.joined).toLocaleDateString()}</td><td>${u.orders}</td><td>$${u.totalSpent.toFixed(2)}</td><td><button class="btn btn-sm btn-outline-primary" onclick="updUserRole('${u._id}','${u.role === 'admin' ? 'user' : 'admin'}')">Make ${u.role === 'admin' ? 'User' : 'Admin'}</button> <button class="btn btn-sm btn-outline-secondary" onclick="sendEmail('${u._id}')">Send Email</button></td></tr>`)
+    .map((u) => `<tr><td>${esc(u.name)}<br><small>${esc(u.email)}</small></td><td>${esc(u.role)}</td><td>${new Date(u.joined).toLocaleDateString()}</td><td>${u.orders}</td><td>$${u.totalSpent.toFixed(2)}</td><td><button class="btn btn-sm btn-outline-primary" onclick="updUserRole('${u._id}','${u.role === 'admin' ? 'user' : 'admin'}')">Make ${u.role === 'admin' ? 'User' : 'Admin'}</button> <button class="btn btn-sm btn-outline-secondary" onclick="sendEmail('${u._id}')">Send Email</button></td></tr>`)
     .join('');
 }
 window.updUserRole = async (id, role) => {
@@ -119,7 +125,7 @@ window.sendEmail = async (id) => {
 async function renderCoupons() {
   const rows = await api('/api/admin/coupons');
   document.getElementById('couponsBody').innerHTML = rows
-    .map((c) => `<tr><td>${c.code}</td><td>${c.discountType} ${c.discountValue}</td><td>${c.usageCount}/${c.maxUses}</td><td>${new Date(c.validFrom).toLocaleDateString()} - ${new Date(c.validUntil).toLocaleDateString()}</td><td>${c.isActive ? 'Active' : 'Inactive'}</td><td><button class="btn btn-sm btn-outline-primary" onclick="editCoupon('${c._id}')">Update</button> <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/coupons/${c._id}')">Delete</button></td></tr>`)
+    .map((c) => `<tr><td>${esc(c.code)}</td><td>${esc(c.discountType)} ${Number(c.discountValue)}</td><td>${c.usageCount}/${c.maxUses}</td><td>${new Date(c.validFrom).toLocaleDateString()} - ${new Date(c.validUntil).toLocaleDateString()}</td><td>${c.isActive ? 'Active' : 'Inactive'}</td><td><button class="btn btn-sm btn-outline-primary" onclick="editCoupon('${c._id}')">Update</button> <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/coupons/${c._id}')">Delete</button></td></tr>`)
     .join('');
 }
 window.editCoupon = async (id) => {
@@ -131,7 +137,7 @@ window.editCoupon = async (id) => {
 
 async function renderNotifications() {
   const rows = await api('/api/admin/notifications');
-  document.getElementById('notifsBody').innerHTML = rows.map((n) => `<tr><td>${n.type}</td><td>${n.user?.email || 'All Users'}</td><td>${n.title}</td><td>${n.message}</td><td>${new Date(n.createdAt).toLocaleDateString()}</td><td><button class="btn btn-sm btn-outline-primary" onclick="editNotif('${n._id}')">Update</button> <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/notifications/${n._id}')">Delete</button></td></tr>`).join('');
+  document.getElementById('notifsBody').innerHTML = rows.map((n) => `<tr><td>${esc(n.type)}</td><td>${esc(n.user?.email || 'All Users')}</td><td>${esc(n.title)}</td><td>${esc(n.message)}</td><td>${new Date(n.createdAt).toLocaleDateString()}</td><td><button class="btn btn-sm btn-outline-primary" onclick="editNotif('${n._id}')">Update</button> <button class="btn btn-sm btn-outline-danger" onclick="del('/api/admin/notifications/${n._id}')">Delete</button></td></tr>`).join('');
 }
 window.editNotif = async (id) => {
   const n = (await api('/api/admin/notifications')).find((x) => x._id === id);
@@ -146,15 +152,15 @@ async function renderBookings() {
   const rows = await api('/api/admin/bookings');
   document.getElementById('bookingsBody').innerHTML = rows
     .map((b) => {
-      const items = (b.orderItems || []).map(i => `${i.name} x${i.qty}`).join(', ') || '-';
+      const items = (b.orderItems || []).map(i => `${esc(i.name)} x${Number(i.qty)}`).join(', ') || '-';
       return `<tr>
-        <td>${b.fullName || '-'}</td>
-        <td>${b.email || '-'}</td>
-        <td>${b.phone || '-'}</td>
-        <td>${b.date || '-'}</td>
-        <td>${b.time || '-'}</td>
-        <td>${b.guests || '-'}</td>
-        <td><small>${b.requests || '-'}</small></td>
+        <td>${esc(b.fullName || '-')}</td>
+        <td>${esc(b.email || '-')}</td>
+        <td>${esc(b.phone || '-')}</td>
+        <td>${esc(b.date || '-')}</td>
+        <td>${esc(b.time || '-')}</td>
+        <td>${esc(b.guests || '-')}</td>
+        <td><small>${esc(b.requests || '-')}</small></td>
         <td><small>${items}</small></td>
         <td><small>${b.createdAt ? new Date(b.createdAt).toLocaleString() : '-'}</small></td>
       </tr>`;
@@ -179,16 +185,16 @@ async function renderLogs() {
   const rows = await api('/api/admin/logs');
   document.getElementById('logsBody').innerHTML = rows.map((l) => {
     const info = parseUA(l.userAgent);
-    const email = l.email ? `<small style="color:var(--accent)">${l.email}</small>` : '';
-    const type = l.actionType ? `<span class="badge bg-secondary me-1">${l.actionType}</span>` : '';
+    const email = l.email ? `<small style="color:var(--accent)">${esc(l.email)}</small>` : '';
+    const type = l.actionType ? `<span class="badge bg-secondary me-1">${esc(l.actionType)}</span>` : '';
     return `<li class="log-item">
       <div class="log-head">
         <strong>${new Date(l.createdAt).toLocaleString()}</strong>
         ${email}
         ${type}
       </div>
-      <div class="log-action">${l.action || l.message || ''}</div>
-      <div class="log-meta"><small>${info.device} · ${info.os} · ${info.browser} ${l.ip ? '· '+l.ip : ''}</small></div>
+      <div class="log-action">${esc(l.action || l.message || '')}</div>
+      <div class="log-meta"><small>${info.device} · ${info.os} · ${info.browser} ${l.ip ? '· ' + esc(l.ip) : ''}</small></div>
     </li>`;
   }).join('');
 }
@@ -215,11 +221,11 @@ async function renderConversations() {
     const email = u?.email || uid;
     const initial = email.charAt(0).toUpperCase();
     const activeClass = adminSelectedUserId === uid ? 'active' : '';
-    return `<div class="conv-user ${activeClass}" data-uid="${uid}" onclick="selectAdminConv('${uid}')">
-      <div class="conv-avatar">${initial}</div>
+    return `<div class="conv-user ${activeClass}" data-uid="${esc(uid)}" onclick="selectAdminConv('${esc(uid)}')">
+      <div class="conv-avatar">${esc(initial)}</div>
       <div class="conv-info">
-        <div class="conv-name">${email}</div>
-        <div class="conv-preview">${lastMsg?.message?.substring(0, 40) || (lastMsg?.fileUrl ? '📎 File' : '') || 'No messages'}</div>
+        <div class="conv-name">${esc(email)}</div>
+        <div class="conv-preview">${esc(lastMsg?.message?.substring(0, 40) || (lastMsg?.fileUrl ? '📎 File' : '') || 'No messages')}</div>
       </div>
       <div class="conv-time">${lastTime}</div>
     </div>`;
@@ -245,10 +251,10 @@ function renderAdminChat(userId) {
   const email = userObj?.email || userId;
 
   document.getElementById('adminChatHeader').innerHTML = `
-    <div class="h-avatar">${email.charAt(0).toUpperCase()}</div>
+    <div class="h-avatar">${esc(email.charAt(0).toUpperCase())}</div>
     <div class="h-info">
-      <div class="h-name">${userObj?.fullName || email}</div>
-      <div class="h-email">${email}</div>
+      <div class="h-name">${esc(userObj?.fullName || email)}</div>
+      <div class="h-email">${esc(email)}</div>
     </div>`;
 
   const msgsEl = document.getElementById('adminChatMsgs');
@@ -258,18 +264,18 @@ function renderAdminChat(userId) {
     let html = '';
     if (m.replyTo) {
       const replyText = typeof m.replyTo === 'object' ? m.replyTo.message : '';
-      if (replyText) html += `<div class="areply"><i class="bi bi-reply-fill"></i> ${replyText}</div>`;
+      if (replyText) html += `<div class="areply"><i class="bi bi-reply-fill"></i> ${esc(replyText)}</div>`;
     }
     if (m.fileUrl) {
       const isImg = m.fileType?.startsWith('image/');
       if (isImg) {
-        html += `<div class="afile"><i class="bi bi-image"></i> <a href="${m.fileUrl}" target="_blank">${m.fileName || 'Image'}</a></div>`;
-        html += `<img src="${m.fileUrl}" style="max-width:160px;border-radius:6px;margin-top:3px;cursor:pointer" onclick="window.open(this.src)">`;
+        html += `<div class="afile"><i class="bi bi-image"></i> <a href="${esc(m.fileUrl)}" target="_blank">${esc(m.fileName || 'Image')}</a></div>`;
+        html += `<img src="${esc(m.fileUrl)}" style="max-width:160px;border-radius:6px;margin-top:3px;cursor:pointer" onclick="window.open(this.src)">`;
       } else {
-        html += `<div class="afile"><i class="bi bi-paperclip"></i> <a href="${m.fileUrl}" target="_blank">${m.fileName || 'File'}</a></div>`;
+        html += `<div class="afile"><i class="bi bi-paperclip"></i> <a href="${esc(m.fileUrl)}" target="_blank">${esc(m.fileName || 'File')}</a></div>`;
       }
     }
-    if (m.message) html += m.message;
+    if (m.message) html += esc(m.message);
     html += `<div class="atime">${time}</div>`;
     if (m.reactions?.length) {
       const counts = m.reactions.reduce((acc, r) => { acc[r.type] = (acc[r.type] || 0) + 1; return acc; }, {});
@@ -287,7 +293,7 @@ function renderAdminChat(userId) {
          <button onclick="adminReactToMsg('${m._id}','😡')" title="Bad">😡</button>
          <button onclick="adminCopyMsg(this)" title="Copy"><i class="bi bi-clipboard"></i></button>`
       : `<button onclick="adminCopyMsg(this)" title="Copy"><i class="bi bi-clipboard"></i></button>
-         <button onclick="adminReplyTo('${m._id}','${(m.message || '').replace(/'/g,"\\'")}')" title="Reply"><i class="bi bi-reply"></i></button>`;
+         <button onclick="adminReplyTo('${m._id}')" title="Reply"><i class="bi bi-reply"></i></button>`;
     html += `<div class="ahover">${actionBtns}</div>`;
 
     return `<div class="amsg ${isUser ? 'user' : 'admin'}" data-msg-id="${m._id}">${html}</div>`;
@@ -328,8 +334,9 @@ function adminCopyMsg(btn) {
   if (text) { navigator.clipboard.writeText(text); toast('Copied!', true); }
 }
 
-function adminReplyTo(id, text) {
-  adminReplyToMsg = { _id: id, message: text };
+function adminReplyTo(id) {
+  const msg = adminConvData.find(c => String(c._id) === String(id));
+  adminReplyToMsg = { _id: id, message: msg?.message || '' };
   adminUpdateReplyIndicator();
   document.getElementById('adminChatInput').focus();
 }
@@ -340,7 +347,7 @@ function adminUpdateReplyIndicator() {
   const el = document.getElementById('adminReplyIndicator');
   if (adminReplyToMsg) {
     el.style.display = 'flex';
-    el.innerHTML = `<i class="bi bi-reply-fill"></i> <span style="flex:1">${adminReplyToMsg.message.substring(0, 50)}</span> <button onclick="adminCancelReply()" style="background:none;border:none;color:#fff;cursor:pointer">&times;</button>`;
+    el.innerHTML = `<i class="bi bi-reply-fill"></i> <span style="flex:1">${esc(adminReplyToMsg.message.substring(0, 50))}</span> <button onclick="adminCancelReply()" style="background:none;border:none;color:#fff;cursor:pointer">&times;</button>`;
   } else {
     el.style.display = 'none';
   }
@@ -361,7 +368,7 @@ async function renderAnalytics() {
   barChart = new Chart(document.getElementById('barChart'), { type: 'bar', data: { labels: a.revenueSeries.map((x) => x.label), datasets: [{ label: 'Revenue', data: a.revenueSeries.map((x) => x.revenue), backgroundColor: '#ff6b6b' }] } });
   if (pieChart) pieChart.destroy();
   pieChart = new Chart(document.getElementById('pieChart'), { type: 'pie', data: { labels: a.byStatus.map((x) => x.status), datasets: [{ data: a.byStatus.map((x) => x.count), backgroundColor: ['#60a5fa', '#a78bfa', '#34d399', '#f87171'] }] } });
-  document.getElementById('topSelling').innerHTML = a.topSelling.map((t) => `<li>${t._id} - Sold ${t.sold} - Revenue $${Number(t.revenue).toFixed(2)}</li>`).join('');
+  document.getElementById('topSelling').innerHTML = a.topSelling.map((t) => `<li>${esc(t._id)} - Sold ${Number(t.sold)} - Revenue $${Number(t.revenue).toFixed(2)}</li>`).join('');
   document.getElementById('storageMetrics').innerHTML = `Users: <b>${m.users}</b> | Categories: <b>${m.categories}</b> | Products: <b>${m.products}</b> | Orders: <b>${m.orders}</b> | Coupons: <b>${m.coupons}</b> | Notifications: <b>${m.notifications}</b> | Bookings: <b>${m.bookings}</b> | Mongo ReadyState: <b>${m.mongoReadyState}</b>`;
 }
 

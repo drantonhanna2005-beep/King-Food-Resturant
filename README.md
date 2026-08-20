@@ -1,20 +1,24 @@
 # King Food Project
 
-## Admin Login
-- Email: `Admin2030@gmail.com`
-- Password: `Admin2030KingFood`
+## Configuration
+Copy `.env.example` to `.env` and fill in your own values. `.env` is git-ignored and must never be committed.
 
-## Mongo + Gmail SMTP
-Set `.env`:
-```env
-PORT=10000
-MONGO_URI=mongodb+srv://drantonhanna2005_db_user:g9h6ArdIDaWQBSRo@cluster0.iygqaqj.mongodb.net/
-SESSION_SECRET=change_me_to_a_long_random_secret
-SMTP_USER=yourgmail@gmail.com
-SMTP_PASS=your_gmail_app_password
+```bash
+cp .env.example .env
+npm install
+npm run dev
 ```
 
-> For real Gmail inbox delivery, use Gmail App Password in `SMTP_PASS`.
+`MONGO_URI` and `SESSION_SECRET` are required — the server refuses to start without them.
+
+## Admin Login
+The admin account is created on first login only when `ADMIN_EMAIL` and `ADMIN_PASSWORD` are set in `.env`.
+Choose your own credentials; they are never hardcoded in the source.
+
+## Email + AI
+- `SMTP_USER` / `SMTP_PASS` (Gmail App Password) are used to deliver password reset codes and admin emails.
+  Without them, reset codes are only logged to the server console in development.
+- `EYEGPT_API_KEY` / `OPENROUTER_API_KEY` enable the AI chat endpoint. It is disabled when neither is set.
 
 ## Features
 - Password eye toggle in login/register/forgot-reset pages.
