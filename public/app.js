@@ -111,7 +111,7 @@ function setupForgot() {
       e.preventDefault();
       try {
         const r = await postJSON('/api/forgot-password', { email: document.getElementById('forgotEmail').value.trim() });
-        showToast(`${r.message}${r.resetCode ? ` (Demo code: ${r.resetCode})` : ''}`);
+        showToast(r.message);
         document.getElementById('resetEmail').value = document.getElementById('forgotEmail').value.trim();
       } catch (e2) {
         showToast(e2.message, 'danger');
