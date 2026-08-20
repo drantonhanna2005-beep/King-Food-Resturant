@@ -512,10 +512,17 @@
         
         try {
             const res = await fetch(url, options);
-            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-            return await res.json();
+            const data = await res.json().catch(() => null);
+            if (!res.ok) {
+                // surface the server's own message instead of a bare status code
+                const err = new Error(data?.message || `Request failed (HTTP ${res.status})`);
+                err.status = res.status;
+                throw err;
+            }
+            if (data === null) throw new Error(`Malformed response from ${url}`);
+            return data;
         } catch (error) {
-            console.error("Fetch Error:", error);
+            console.error(`Fetch Error (${url}):`, error);
             throw error; // رمي الخطأ ليتم التقاطه في الـ catch الخارجية
         }
     }
@@ -548,13 +555,20 @@
           return;
         }
       } catch (e) {
-        // إذا فشل البروفايل، نفتح الشات مبدئياً لكي لا يتجمد الواجهة ولكن بـ User ID مجهول
-        // سيعتمد السيرفر على الـ Session المخزنة لديه لاستخراج الـ ID
-        console.warn("Could not verify ID from profile, relying on Server Session.", e);
+        console.error("Could not verify the session from the profile endpoint:", e);
+        if (e.status === 401 || e.status === 403) {
+          // a genuine auth failure must not look like a working chat
+          chatMsg.placeholder = "Please login to chat.";
+          if (typeof toast !== 'undefined') toast('Please log in to contact support', false);
+          return;
+        }
+        // other failures (network/server) still rely on the server session, but
+        // the user is told the session could not be confirmed
         chatMsg.disabled = false;
         sendBtn.disabled = false;
         if(attachBtn) attachBtn.disabled = false;
         chatMsg.placeholder = "Type a message...";
+        if (typeof toast !== 'undefined') toast(`Could not verify your session: ${e.message}`, false);
       }
 
       // 2. إعداد الـ Socket
@@ -583,9 +597,17 @@
           
           supportSocket.on('support:error', (err) => {
              console.error("Socket Error:", err);
+             if (typeof toast !== 'undefined') toast(err?.message || 'Support chat error', false);
+          });
+
+          supportSocket.on('connect_error', (err) => {
+             console.error("Socket connection error:", err);
           });
         }
-      } catch (e) { console.error("Socket Init Error:", e); }
+      } catch (e) {
+        console.error("Socket Init Error:", e);
+        if (typeof toast !== 'undefined') toast('Live chat updates are unavailable', false);
+      }
 
       // 3. جلب المحادثات السابقة عبر safeFetch
       try {
@@ -597,7 +619,17 @@
              convs.forEach(m => appendMessage(m));
         }
         chatBox.scrollTop = chatBox.scrollHeight;
-      } catch (e) { console.error("Failed to load history", e); }
+      } catch (e) {
+        console.error("Failed to load history", e);
+        if (e.status !== 401) {
+          const emptyEl = document.getElementById('chatEmpty');
+          if (emptyEl) {
+            emptyEl.style.display = 'block';
+            emptyEl.textContent = 'Could not load previous messages. Please refresh the page.';
+          }
+          if (typeof toast !== 'undefined') toast('Could not load previous messages', false);
+        }
+      }
 
       // 4. دالة الإرسال المؤمّنة باستخدام safeFetch
       async function sendMessage() {
@@ -639,10 +671,11 @@
           if (supportSocket && supportSocket.connected) {
             supportSocket.emit('support:user-message', savedMsg);
           }
-        } catch (e) { 
+        } catch (e) {
+          console.error('Sending support message failed:', e);
           const tempEl = chatBox.querySelector(`[data-msg-id="${tempId}"]`);
           if (tempEl) tempEl.style.opacity = '0.5';
-          if(typeof toast !== 'undefined') toast('Session expired or network error. Refresh to login.', false);
+          if(typeof toast !== 'undefined') toast(`Message not sent: ${e.message}`, false);
         }
       }
 
@@ -659,8 +692,8 @@
             formData.append('file', file);
             try {
               const res = await fetch('/api/upload', { method: 'POST', body: formData, credentials: 'include' });
-              if(!res.ok) throw new Error("Upload Error");
-              const data = await res.json();
+              const data = await res.json().catch(() => ({}));
+              if(!res.ok) throw new Error(data.message || `Upload failed (HTTP ${res.status})`);
               
               const tempId = 'temp-' + Date.now();
               const tempMsg = {
@@ -693,7 +726,10 @@
               if (supportSocket && supportSocket.connected) {
                 supportSocket.emit('support:user-message', savedMsg);
               }
-            } catch (e) { if(typeof toast !== 'undefined') toast('Upload failed', false); }
+            } catch (e) {
+              console.error('Support attachment upload failed:', e);
+              if(typeof toast !== 'undefined') toast(`Upload failed: ${e.message}`, false);
+            }
             fileInput.value = '';
           };
       }
@@ -769,7 +805,13 @@
     function copyMsg(btn) {
       const msgDiv = btn.closest('.msg');
       const text = msgDiv.childNodes[0]?.textContent?.trim() || '';
-      if (text) { navigator.clipboard.writeText(text); if(typeof toast !== 'undefined') toast('Copied!', true); }
+      if (!text) return;
+      navigator.clipboard.writeText(text)
+        .then(() => { if(typeof toast !== 'undefined') toast('Copied!', true); })
+        .catch((e) => {
+          console.error('Copy failed:', e);
+          if(typeof toast !== 'undefined') toast('Could not copy the message', false);
+        });
     }
 
     function replyTo(id, text) {
@@ -799,7 +841,11 @@
       if (supportSocket && currentUserId) {
         supportSocket.emit('support:reaction', { messageId, emoji, userId: currentUserId });
       } else {
-        safeFetch('/api/user/conversations/reaction', { method: 'POST', body: JSON.stringify({ messageId, emoji }) }).catch(() => { });
+        safeFetch('/api/user/conversations/reaction', { method: 'POST', body: JSON.stringify({ messageId, emoji }) })
+          .catch((e) => {
+            console.error('Reaction failed:', e);
+            if(typeof toast !== 'undefined') toast(`Reaction failed: ${e.message}`, false);
+          });
       }
     }
 

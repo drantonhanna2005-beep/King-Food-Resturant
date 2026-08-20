@@ -703,6 +703,20 @@
   </div>
 
   <script>
+    // Shared fetch wrapper: the raw fetch().then(r => r.json()) pattern used to
+    // treat error pages as data and hid the real HTTP status.
+    async function getJSON(url, options) {
+      const res = await fetch(url, options);
+      const data = await res.json().catch(() => null);
+      if (!res.ok) {
+        const err = new Error(data?.message || `Request failed (HTTP ${res.status})`);
+        err.status = res.status;
+        throw err;
+      }
+      if (data === null) throw new Error(`Malformed response from ${url}`);
+      return data;
+    }
+
     let currentSessionId = null;
     let orderItems = [];
     let panelMode = 'products';
@@ -743,7 +757,7 @@
       if (orderItems.length === 0) { alert('No items in your order'); return; }
       try {
         // Check user's addresses
-        const addresses = await fetch('/api/user/addresses').then(r => r.json());
+        const addresses = await getJSON('/api/user/addresses');
         let selectedAddressId = null;
 
         if (addresses.length === 0) {
@@ -776,8 +790,8 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ items: orderItems.map(i => ({ id: i.id, qty: i.qty })), addressId: selectedAddressId })
         });
-        if (!res.ok) { const d = await res.json(); throw new Error(d.message); }
-        const order = await res.json();
+        const order = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(order.message || `Order failed (HTTP ${res.status})`);
         orderItems = [];
         updateOrderSummary();
         loadProductsPanel();
@@ -865,22 +879,30 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: text, sessionId: currentSessionId })
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         typingDiv.remove();
+        if (!res.ok) {
+          // the server sends a user-facing reply with its 4xx/5xx status
+          console.error(`Chat request failed (HTTP ${res.status})`, data);
+          appendMsg(data.reply || data.message || 'The assistant is unavailable right now. Please try again.', 'bot');
+          return;
+        }
         appendMsg(data.reply, 'bot');
         chatHistory.push({ role: 'assistant', content: data.reply });
         currentSessionId = data.sessionId;
         loadHistory();
       } catch (e) {
         typingDiv.remove();
+        console.error('Chat request failed:', e);
         appendMsg('Connection error. Please try again.', 'bot');
+      } finally {
+        btn.disabled = false;
       }
-      btn.disabled = false;
     }
 
     async function loadHistory() {
       try {
-        const sessions = await fetch('/api/chat/history').then(r => r.json());
+        const sessions = await getJSON('/api/chat/history');
         const list = document.getElementById('historyList');
         list.innerHTML = sessions.map(s =>
           `<div class="history-item${currentSessionId === s._id ? ' active' : ''}" data-id="${s._id}">
@@ -897,7 +919,13 @@
         list.querySelectorAll('.hi-del').forEach(el => {
           el.onclick = async (e) => {
             e.stopPropagation();
-            await fetch('/api/chat/session/' + el.dataset.id, { method: 'DELETE' });
+            try {
+              await getJSON('/api/chat/session/' + el.dataset.id, { method: 'DELETE' });
+            } catch (err) {
+              console.error('Deleting chat session failed:', err);
+              alert('Could not delete this chat: ' + err.message);
+              return;
+            }
             if (currentSessionId === el.dataset.id) {
               currentSessionId = null;
               document.getElementById('chatBody').innerHTML = '<div class="msg bot">👋 Hello! I\'m King Food AI. How can I help you today?</div>';
@@ -906,12 +934,18 @@
             loadHistory();
           };
         });
-      } catch (e) { /* not logged in */ }
+      } catch (e) {
+        // 401 simply means the visitor is not logged in and has no history
+        if (e.status === 401) return;
+        console.error('Loading chat history failed:', e);
+        const list = document.getElementById('historyList');
+        if (list) list.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:12px">Could not load chat history</div>';
+      }
     }
 
     async function loadSession(id) {
       try {
-        const session = await fetch('/api/chat/session/' + id).then(r => r.json());
+        const session = await getJSON('/api/chat/session/' + id);
         currentSessionId = session._id;
         const body = document.getElementById('chatBody');
         body.innerHTML = '';
@@ -924,16 +958,20 @@
           body.innerHTML = '<div class="msg bot">👋 Hello! I\'m King Food AI. How can I help you today?</div>';
         }
         loadHistory();
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error('Loading chat session failed:', e);
+        alert('Could not open this chat: ' + e.message);
+      }
     }
 
     async function loadProductsPanel() {
       try {
-        const data = await fetch('/api/store/products').then(r => r.json());
+        const data = await getJSON('/api/store/products');
         allProducts = Array.isArray(data) ? data : data.products || [];
         renderProductsPanel(allProducts);
       } catch (e) {
-        document.getElementById('rightPanelBody').innerHTML = '<p style="color:var(--muted);font-size:13px;padding:20px;text-align:center;">Failed to load products</p>';
+        console.error('Loading products panel failed:', e);
+        document.getElementById('rightPanelBody').innerHTML = `<p style="color:var(--muted);font-size:13px;padding:20px;text-align:center;">Failed to load products: ${e.message}</p>`;
       }
     }
 
@@ -964,7 +1002,7 @@
 
     async function loadWishlistPanel() {
       try {
-        const data = await fetch('/api/user/wishlist').then(r => r.json());
+        const data = await getJSON('/api/user/wishlist');
         allWishlist = Array.isArray(data) ? data : [];
         const body = document.getElementById('rightPanelBody');
         if (allWishlist.length === 0) {
@@ -995,7 +1033,10 @@
       </div>`;
         }).filter(Boolean).join('');
       } catch (e) {
-        document.getElementById('rightPanelBody').innerHTML = '<p style="color:var(--muted);font-size:13px;padding:20px;text-align:center;">Login to see your wishlist</p>';
+        console.error('Loading wishlist panel failed:', e);
+        document.getElementById('rightPanelBody').innerHTML = e.status === 401
+          ? '<p style="color:var(--muted);font-size:13px;padding:20px;text-align:center;">Login to see your wishlist</p>'
+          : `<p style="color:var(--muted);font-size:13px;padding:20px;text-align:center;">Failed to load wishlist: ${e.message}</p>`;
       }
     }
 

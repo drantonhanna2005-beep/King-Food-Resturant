@@ -84,9 +84,25 @@ const t = (key) => translations[lang.get()]?.[key] || translations.en[key];
 const api = async (u, o = {}) => {
   const r = await fetch(u, { headers: { 'Content-Type': 'application/json' }, ...o });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.message || 'Error');
+  if (!r.ok) {
+    const err = new Error(d.message || `Request failed (HTTP ${r.status})`);
+    err.status = r.status;
+    throw err;
+  }
   return d;
 };
+
+// A 401 is the expected "guest is browsing" case; anything else is a real
+// failure that must be logged and shown instead of an empty state.
+const isAuthError = (e) => e?.status === 401;
+
+function renderLoadError(el, e, what) {
+  console.error(`Failed to load ${what}:`, e);
+  if (!el) return;
+  el.innerHTML = isAuthError(e)
+    ? `<p class='text-secondary'>Please <a href='/login.html'>log in</a> to see your ${what}.</p>`
+    : `<p class='text-danger'>Could not load ${what}. Please refresh and try again.</p>`;
+}
 
 const state = { products: [], categories: [], selectedCategory: null };
 
@@ -318,19 +334,27 @@ function renderProducts(arr) {
 }
 
 async function refreshBadges() {
+  // badges are decoration: a guest (401) legitimately has none, but any other
+  // failure is logged instead of being hidden behind a zero.
+  const badge = (url, fallback) => api(url).catch(e => {
+    if (!isAuthError(e)) console.error(`refreshBadges: ${url} failed:`, e);
+    return fallback;
+  });
   try {
     const [c, w, o, n] = await Promise.all([
-      api('/api/user/cart').catch(() => ({ items: [] })),
-      api('/api/user/wishlist').catch(() => []),
-      api('/api/user/orders').catch(() => []),
-      api('/api/user/notifications').catch(() => [])
+      badge('/api/user/cart', { items: [] }),
+      badge('/api/user/wishlist', []),
+      badge('/api/user/orders', []),
+      badge('/api/user/notifications', [])
     ]);
     const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
     set('cartBadge', c.items?.reduce((s, i) => s + i.qty, 0) || 0);
     set('wishBadge', w.length || 0);
     set('orderBadge', o.length || 0);
     set('notifBadge', n.length || 0);
-  } catch { }
+  } catch (e) {
+    console.error('refreshBadges error:', e);
+  }
 }
 
 // ==================== CART ====================
@@ -341,7 +365,8 @@ async function initCart() {
   try {
     c = await api('/api/user/cart');
   } catch (e) {
-    document.getElementById('cartList').innerHTML = `<p class='text-secondary'>${t('noCart')}</p>`;
+    // a failed request is not an empty cart
+    renderLoadError(document.getElementById('cartList'), e, 'cart');
     return;
   }
 
@@ -548,7 +573,7 @@ async function initOrders() {
       </div>`
     ).join('') || '<div class="text-secondary">No orders yet</div>';
   } catch (e) {
-    console.error('initOrders error:', e);
+    renderLoadError(document.getElementById('ordersList'), e, 'orders');
   }
 }
 
@@ -573,7 +598,7 @@ async function initWishlist() {
     ).join('');
     document.querySelectorAll('.add-w').forEach(b => b.onclick = () => addToCart(b.dataset.id));
   } catch (e) {
-    console.error('initWishlist error:', e);
+    renderLoadError(document.getElementById('wishList'), e, 'wishlist');
   }
 }
 
@@ -603,7 +628,7 @@ async function initNotifications() {
       </div>`
     ).join('') || '<div class="text-center text-secondary mt-4">No notifications yet</div>';
   } catch (e) {
-    console.error('initNotifications error:', e);
+    renderLoadError(container, e, 'notifications');
   }
 }
 
@@ -639,6 +664,7 @@ async function markSingleNotificationRead(id) {
     if (current > 0) updateNotificationBadge(current - 1);
   } catch (e) {
     console.error('Failed to mark notification as read:', e);
+    toast(e.message || 'Could not mark the notification as read', false);
   }
 }
 
@@ -654,6 +680,7 @@ async function markAllNotificationsRead() {
     if (document.getElementById('nots')) setTimeout(() => initNotifications(), 300);
   } catch (e) {
     console.error('Failed to mark all as read:', e);
+    toast(e.message || 'Could not mark all notifications as read', false);
   }
 }
 
@@ -698,7 +725,7 @@ async function initAddresses() {
       const emptyState = document.getElementById('emptyAddresses');
       if (emptyState) emptyState.style.display = addressCache.length === 0 ? 'block' : 'none';
     } catch (e) {
-      console.error('loadAddresses error:', e);
+      renderLoadError(document.getElementById('addressList'), e, 'addresses');
     }
   };
 
@@ -863,7 +890,7 @@ async function initHome() {
     if (applyFilter) applyFilter.onclick = applyFilterFn;
     refreshBadges();
   } catch (e) {
-    console.error('initHome error:', e);
+    renderLoadError(document.getElementById('productsGrid'), e, 'menu');
   }
 }
 
@@ -884,7 +911,7 @@ async function initProduct() {
       <button class='btn btn-primary' id='addP'>${t('cart')}</button>`;
     document.getElementById('addP').onclick = () => addToCart(p._id);
   } catch (e) {
-    console.error('initProduct error:', e);
+    renderLoadError(document.getElementById('productDetails'), e, 'product');
   }
 }
 
@@ -947,12 +974,16 @@ async function initProfile() {
       logoutUser.onclick = async () => {
         try {
           await api('/api/logout', { method: 'POST' });
-        } catch { }
+        } catch (e) {
+          // still leave the page, but do not pretend the server logged us out
+          console.error('Logout request failed:', e);
+          toast('Logout may not have completed on the server', false);
+        }
         location.href = '/login.html';
       };
     }
   } catch (e) {
-    console.error('initProfile error:', e);
+    renderLoadError(document.getElementById('profileCard'), e, 'profile');
   }
 }
 
@@ -1003,10 +1034,14 @@ async function initTourGuide() {
   if (!document.body) return;
 
   try {
-    // Check if user already completed tour (server-side per email)
-    const status = await api('/api/user/tour-status').catch(() => ({ tourCompleted: true }));
+    // Tour state is non-critical: if it cannot be read, skip the tour rather
+    // than replaying it, but log why.
+    const status = await api('/api/user/tour-status');
     if (status.tourCompleted) return;
-  } catch { return; }
+  } catch (e) {
+    if (!isAuthError(e)) console.error('Could not read tour status:', e);
+    return;
+  }
 
   const tourSteps = [
     { icon: 'bi-house-fill', title: 'Welcome to King Food', desc: 'This quick tour will guide you through every feature of our restaurant platform. Let\'s get started!', target: null },
@@ -1064,7 +1099,11 @@ async function initTourGuide() {
   async function completeTour() {
     try {
       await api('/api/user/tour-complete', { method: 'POST' });
-    } catch { }
+    } catch (e) {
+      // the tour would otherwise silently reappear on the next page load
+      console.error('Could not save tour completion:', e);
+      toast('Could not save your tour progress', false);
+    }
     tourOverlay.remove();
   }
 
@@ -1114,7 +1153,9 @@ function createInstallButton() {
         if (outcome === 'accepted') {
           btn.style.display = 'none';
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error('PWA install prompt failed:', e);
+      }
       deferredPrompt = null;
     } else {
       alert('Install King Food App:\n\n1. Click the ⋮ menu in Chrome\n2. Select "Install app" or "Add to Home screen"\n\nThe King Food icon will appear on your device!');
@@ -1150,7 +1191,9 @@ function createInstallButton() {
         if (outcome === 'accepted') {
           btn.style.display = 'none';
         }
-      } catch (e) { }
+      } catch (e) {
+        console.error('PWA install prompt failed:', e);
+      }
       deferredPrompt = null;
     } else {
       // If prompt not captured yet, show instructions
@@ -1196,6 +1239,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const data = await api('/api/user/notifications');
       const unread = (data || []).filter(n => !n.isRead).length;
       updateNotificationBadge(unread);
-    } catch { }
+    } catch (e) {
+      if (!isAuthError(e)) console.error('Notification badge sync failed:', e);
+    }
   })();
 });
